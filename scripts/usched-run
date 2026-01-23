@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# sched-run - Wrapper script for usched job execution
+# Checks constraints (DND, time ranges) before executing the command
+
+set -euo pipefail
+
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/usched"
+JOBS_FILE="$DATA_DIR/jobs.json"
+STATE_FILE="$DATA_DIR/state.json"
+
+log() {
+    echo "[usched-run] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
+}
+
+# Check if DND is active
+is_dnd_active() {
+    if [[ ! -f "$STATE_FILE" ]]; then
+        return 1
+    fi
+
+    local dnd_until
+    dnd_until=$(jq -r '.dnd_until // empty' "$STATE_FILE" 2>/dev/null || true)
+
+    if [[ -z "$dnd_until" ]]; then
+        return 1
+    fi
+
+    local dnd_timestamp now_timestamp
+    dnd_timestamp=$(date -d "$dnd_until" +%s 2>/dev/null || echo 0)
+    now_timestamp=$(date +%s)
+
+    [[ "$now_timestamp" -lt "$dnd_timestamp" ]]
+}
+
+# Check if current time is within a time range (handles midnight wrap)
+is_time_in_range() {
+    local start="$1"
+    local end="$2"
+    local now
+    now=$(date +%H:%M)
+
+    # Convert times to minutes for comparison
+    local now_mins start_mins end_mins
+    now_mins=$((10#${now%:*} * 60 + 10#${now#*:}))
+    start_mins=$((10#${start%:*} * 60 + 10#${start#*:}))
+    end_mins=$((10#${end%:*} * 60 + 10#${end#*:}))
+
+    if [[ "$start_mins" -le "$end_mins" ]]; then
+        # Normal range (e.g., 09:00-17:00)
+        [[ "$now_mins" -ge "$start_mins" && "$now_mins" -lt "$end_mins" ]]
+    else
+        # Midnight wrap (e.g., 22:00-08:00)
+        [[ "$now_mins" -ge "$start_mins" || "$now_mins" -lt "$end_mins" ]]
+    fi
+}
+
+# Get job constraints from jobs.json
+get_job() {
+    local job_id="$1"
+    if [[ ! -f "$JOBS_FILE" ]]; then
+        return 1
+    fi
+    jq -r ".jobs[\"$job_id\"] // empty" "$JOBS_FILE"
+}
+
+main() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: usched-run <job-id> <command...>" >&2
+        exit 1
+    fi
+
+    local job_id="$1"
+    shift
+    local command=("$@")
+
+    log "Checking constraints for job '$job_id'"
+
+    # Get job info
+    local job
+    job=$(get_job "$job_id")
+
+    if [[ -z "$job" ]]; then
+        log "WARNING: Job '$job_id' not found in $JOBS_FILE, running anyway"
+        exec "${command[@]}"
+    fi
+
+    # Check if job is enabled
+    local enabled
+    enabled=$(echo "$job" | jq -r '.enabled // true')
+    if [[ "$enabled" != "true" ]]; then
+        log "Job '$job_id' is disabled, skipping"
+        exit 0
+    fi
+
+    # Check DND constraint
+    local dnd_aware
+    dnd_aware=$(echo "$job" | jq -r '.constraints.dnd_aware // false')
+    if [[ "$dnd_aware" == "true" ]] && is_dnd_active; then
+        log "DND is active, skipping job '$job_id'"
+        exit 0
+    fi
+
+    # Check not_during constraints
+    local not_during
+    not_during=$(echo "$job" | jq -r '.constraints.not_during // []')
+    local range_count
+    range_count=$(echo "$not_during" | jq 'length')
+
+    for ((i = 0; i < range_count; i++)); do
+        local start end
+        start=$(echo "$not_during" | jq -r ".[$i].start")
+        end=$(echo "$not_during" | jq -r ".[$i].end")
+
+        if is_time_in_range "$start" "$end"; then
+            log "Current time is in not_during range $start-$end, skipping job '$job_id'"
+            exit 0
+        fi
+    done
+
+    # Check only_during constraints (if any)
+    local only_during
+    only_during=$(echo "$job" | jq -r '.constraints.only_during // []')
+    local only_count
+    only_count=$(echo "$only_during" | jq 'length')
+
+    if [[ "$only_count" -gt 0 ]]; then
+        local in_allowed_range=false
+        for ((i = 0; i < only_count; i++)); do
+            local start end
+            start=$(echo "$only_during" | jq -r ".[$i].start")
+            end=$(echo "$only_during" | jq -r ".[$i].end")
+
+            if is_time_in_range "$start" "$end"; then
+                in_allowed_range=true
+                break
+            fi
+        done
+
+        if [[ "$in_allowed_range" != "true" ]]; then
+            log "Current time not in any only_during range, skipping job '$job_id'"
+            exit 0
+        fi
+    fi
+
+    # Check if job should auto-remove on success
+    local remove_on_success
+    remove_on_success=$(echo "$job" | jq -r '.constraints.remove_on_success // false')
+
+    # All constraints passed, execute the command
+    log "All constraints passed, executing: ${command[*]}"
+
+    if [[ "$remove_on_success" == "true" ]]; then
+        # Run command and capture exit code
+        "${command[@]}"
+        local exit_code=$?
+
+        if [[ $exit_code -eq 0 ]]; then
+            log "Job '$job_id' completed successfully (exit code 0), auto-removing"
+            usched remove "$job_id" 2>&1 | while read -r line; do log "$line"; done
+        else
+            log "Job '$job_id' failed with exit code $exit_code, not removing"
+        fi
+
+        exit $exit_code
+    else
+        exec "${command[@]}"
+    fi
+}
+
+main "$@"
