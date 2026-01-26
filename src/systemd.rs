@@ -110,13 +110,13 @@ pub fn list_timers() -> Result<String> {
 fn get_wrapper_path() -> String {
     // Look for usched-run in the data directory or PATH
     let data_dir = get_data_dir();
-    let wrapper_in_data = data_dir.join("uusched-run");
+    let wrapper_in_data = data_dir.join("usched-run");
     if wrapper_in_data.exists() {
         return wrapper_in_data.to_string_lossy().to_string();
     }
 
     // Fall back to expecting it in PATH
-    "uusched-run".to_string()
+    "usched-run".to_string()
 }
 
 fn shell_escape(s: &str) -> String {
