@@ -39,11 +39,17 @@ is_time_in_range() {
     local now
     now=$(date +%H:%M)
 
+    # Extract hours and minutes (handles both HH:MM and HH:MM:SS)
+    local now_h now_m start_h start_m end_h end_m
+    IFS=: read -r now_h now_m _ <<< "$now"
+    IFS=: read -r start_h start_m _ <<< "$start"
+    IFS=: read -r end_h end_m _ <<< "$end"
+
     # Convert times to minutes for comparison
     local now_mins start_mins end_mins
-    now_mins=$((10#${now%:*} * 60 + 10#${now#*:}))
-    start_mins=$((10#${start%:*} * 60 + 10#${start#*:}))
-    end_mins=$((10#${end%:*} * 60 + 10#${end#*:}))
+    now_mins=$((10#$now_h * 60 + 10#$now_m))
+    start_mins=$((10#$start_h * 60 + 10#$start_m))
+    end_mins=$((10#$end_h * 60 + 10#$end_m))
 
     if [[ "$start_mins" -le "$end_mins" ]]; then
         # Normal range (e.g., 09:00-17:00)
