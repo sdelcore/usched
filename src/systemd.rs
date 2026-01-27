@@ -108,14 +108,35 @@ pub fn list_timers() -> Result<String> {
 }
 
 fn get_wrapper_path() -> String {
-    // Look for usched-run in the data directory or PATH
+    // Look for usched-run in the data directory
     let data_dir = get_data_dir();
     let wrapper_in_data = data_dir.join("usched-run");
     if wrapper_in_data.exists() {
         return wrapper_in_data.to_string_lossy().to_string();
     }
 
-    // Fall back to expecting it in PATH
+    // Try to find usched-run using `which` to get absolute path
+    // (systemd user services don't have the full user PATH)
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("usched-run")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+
+    // Check common nix profile locations
+    let home = std::env::var("HOME").unwrap_or_default();
+    let nix_profile = format!("{}/.nix-profile/bin/usched-run", home);
+    if std::path::Path::new(&nix_profile).exists() {
+        return nix_profile;
+    }
+
+    // Last resort - hope it's in PATH (unlikely to work for systemd)
     "usched-run".to_string()
 }
 
