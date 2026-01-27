@@ -28,6 +28,13 @@ pub fn create_timer(
             .join(" ")
     );
 
+    // Capture current PATH so usched-run (and its #!/usr/bin/env bash shebang)
+    // can find bash inside systemd's limited environment
+    let path_env = format!(
+        "--setenv=PATH={}",
+        std::env::var("PATH").unwrap_or_default()
+    );
+
     let output = Command::new("systemd-run")
         .args([
             "--user",
@@ -36,6 +43,7 @@ pub fn create_timer(
             "--on-calendar",
             &oncalendar,
             "--timer-property=Persistent=true",
+            &path_env,
             "--",
             "bash",
             "-c",
