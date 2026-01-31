@@ -158,25 +158,6 @@ at/systemd triggers → usched-run <job-id> <command>
 - Jobs: `~/.local/share/usched/jobs.json`
 - State: `~/.local/share/usched/state.json` (DND timestamp)
 
-## Integration with ARIA
-
-usched is designed to work with ARIA for:
-- Scheduling periodic vault reviews
-- Time-based notifications with DND awareness
-- Remote job monitoring patterns
-- Maintenance tasks
-
-Example ARIA integration:
-
-```bash
-# Morning briefing
-usched add --name "briefing" --cron "0 9 * * *" --dnd-aware -- aria briefing
-
-# Proactive checks (not during sleep)
-usched add --name "proactive" --cron "*/30 * * * *" \
-  --not-during "22:00-08:00" --dnd-aware -- aria review
-```
-
 ## Building
 
 ```bash

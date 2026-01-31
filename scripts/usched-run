@@ -12,16 +12,6 @@ log() {
     echo "[usched-run] $(date '+%Y-%m-%d %H:%M:%S') $*" >&2
 }
 
-# Load secrets from opnix if available (for ARIA commands needing HA_TOKEN, etc.)
-load_secrets() {
-    local secrets_dir="/var/lib/opnix/secrets"
-    if [[ -d "$secrets_dir" ]]; then
-        [[ -f "$secrets_dir/haToken" ]] && export HA_TOKEN=$(cat "$secrets_dir/haToken" | tr -d '[:space:]')
-        [[ -f "$secrets_dir/discordBotToken" ]] && export DISCORD_BOT_TOKEN=$(cat "$secrets_dir/discordBotToken" | tr -d '[:space:]')
-        [[ -f "$secrets_dir/discordClientId" ]] && export DISCORD_CLIENT_ID=$(cat "$secrets_dir/discordClientId" | tr -d '[:space:]')
-    fi
-}
-
 # Check if DND is active
 is_dnd_active() {
     if [[ ! -f "$STATE_FILE" ]]; then
@@ -162,8 +152,7 @@ main() {
     local remove_on_success
     remove_on_success=$(echo "$job" | jq -r '.constraints.remove_on_success // false')
 
-    # All constraints passed, load secrets and execute the command
-    load_secrets
+    # All constraints passed, execute the command
     log "All constraints passed, executing: ${command[*]}"
 
     if [[ "$remove_on_success" == "true" ]]; then
