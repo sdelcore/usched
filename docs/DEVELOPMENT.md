@@ -34,11 +34,17 @@ usched/
 │   ├── store.rs         # JSON persistence
 │   ├── systemd.rs       # systemd timer/service creation
 │   ├── at.rs            # at command integration
-│   └── cron_convert.rs  # Cron to OnCalendar conversion
+│   ├── cron_convert.rs  # Cron to OnCalendar conversion
+│   └── dnd.rs           # Do Not Disturb logic
 ├── scripts/
 │   └── usched-run       # Constraint enforcement wrapper
+├── docs/
+│   ├── ARCHITECTURE.md
+│   └── DEVELOPMENT.md
 ├── Cargo.toml
-└── flake.nix
+├── flake.nix
+├── LICENSE
+└── README.md
 ```
 
 ## Key Files
@@ -51,6 +57,7 @@ usched/
 | `src/systemd.rs` | Generate and manage systemd units |
 | `src/at.rs` | Interface with at/atq/atrm commands |
 | `src/cron_convert.rs` | Convert cron expressions to OnCalendar |
+| `src/dnd.rs` | DND state management and duration parsing |
 | `scripts/usched-run` | Shell script for constraint checking |
 
 ## Adding a New Constraint
