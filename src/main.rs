@@ -87,6 +87,9 @@ enum Commands {
     /// Show upcoming scheduled runs
     Next,
 
+    /// Sync: verify and reconstruct missing timers
+    Sync,
+
     /// Manage Do Not Disturb mode
     Dnd {
         #[command(subcommand)]
@@ -126,6 +129,7 @@ fn main() -> Result<()> {
         Commands::Disable { id } => cmd_disable(&id),
         Commands::Run { id } => cmd_run(&id),
         Commands::Next => cmd_next(),
+        Commands::Sync => cmd_sync(),
         Commands::Dnd { action } => match action {
             DndAction::Set { duration } => dnd::set_dnd(&duration),
             DndAction::Off => dnd::clear_dnd(),
@@ -355,6 +359,65 @@ fn cmd_next() -> Result<()> {
     } else {
         print!("{}", at_jobs);
     }
+
+    Ok(())
+}
+
+fn cmd_sync() -> Result<()> {
+    let mut store = JobStore::load()?;
+    let jobs: Vec<_> = store.list().iter().map(|j| (*j).clone()).collect();
+
+    let mut fixed = 0;
+    let mut ok = 0;
+    let mut skipped = 0;
+
+    for job in jobs {
+        // Only sync recurring (cron) jobs - at jobs don't need syncing
+        if let Schedule::Cron { .. } = &job.schedule {
+            let unit_name = job.systemd_unit.as_ref().map(|s| s.as_str()).unwrap_or("");
+
+            if unit_name.is_empty() {
+                // Job has no systemd unit recorded, recreate it
+                println!("Recreating timer for '{}' (no unit recorded)...", job.id);
+                match systemd::recreate_timer(&job) {
+                    Ok(new_unit) => {
+                        if let Some(j) = store.get_mut(&job.id) {
+                            j.systemd_unit = Some(new_unit.clone());
+                        }
+                        println!("  Created: {}", new_unit);
+                        fixed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
+                    }
+                }
+            } else if !systemd::verify_timer(unit_name) {
+                // Timer exists in job store but not in systemd
+                println!("Recreating missing timer for '{}' ({})...", job.id, unit_name);
+                match systemd::recreate_timer(&job) {
+                    Ok(new_unit) => {
+                        if let Some(j) = store.get_mut(&job.id) {
+                            j.systemd_unit = Some(new_unit.clone());
+                        }
+                        println!("  Recreated: {}", new_unit);
+                        fixed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
+                    }
+                }
+            } else {
+                ok += 1;
+            }
+        } else {
+            skipped += 1;
+        }
+    }
+
+    store.save()?;
+
+    println!();
+    println!("Sync complete: {} ok, {} fixed, {} skipped (one-off jobs)", ok, fixed, skipped);
 
     Ok(())
 }
