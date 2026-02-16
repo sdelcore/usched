@@ -59,6 +59,9 @@ WantedBy=timers.target
         timer_content,
     )?;
 
+    // Resolve bash path (NixOS doesn't have /bin/bash)
+    let bash_path = get_bash_path();
+
     // Write .service file
     let service_content = format!(
         r#"[Unit]
@@ -67,7 +70,7 @@ Description=usched job: {job_id}
 [Service]
 Type=oneshot
 Environment="PATH={path_env}"
-ExecStart=/bin/bash -c '{full_command}'
+ExecStart={bash_path} -c '{full_command}'
 "#
     );
     fs::write(
@@ -214,6 +217,25 @@ pub fn recreate_timer(job: &Job) -> Result<String> {
     } else {
         anyhow::bail!("Cannot recreate timer for non-cron job")
     }
+}
+
+/// Resolve the absolute path to bash.
+/// On NixOS, /bin/bash doesn't exist so we need to find it dynamically.
+fn get_bash_path() -> String {
+    if let Ok(output) = std::process::Command::new("which")
+        .arg("bash")
+        .output()
+    {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return path;
+            }
+        }
+    }
+
+    // Fallback for standard Linux
+    "/bin/bash".to_string()
 }
 
 fn get_wrapper_path() -> String {
