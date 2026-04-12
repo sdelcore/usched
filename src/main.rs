@@ -1,8 +1,9 @@
 mod at;
 mod cron_convert;
 mod dnd;
+pub mod history;
 mod job;
-mod store;
+pub mod store;
 mod systemd;
 
 use anyhow::Result;
@@ -133,6 +134,31 @@ enum Commands {
     /// Check health of all jobs and timers
     Check,
 
+    /// Show execution history
+    History {
+        /// Filter by job ID or name
+        job: Option<String>,
+
+        /// Only show failed executions
+        #[arg(long)]
+        failed: bool,
+
+        /// Number of entries to show
+        #[arg(short = 'n', long, default_value = "20")]
+        limit: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Record a job execution (used by usched-run wrapper)
+    #[command(hide = true)]
+    Log {
+        #[command(subcommand)]
+        action: LogAction,
+    },
+
     /// Manage Do Not Disturb mode
     Dnd {
         #[command(subcommand)]
@@ -151,6 +177,35 @@ enum DndAction {
     Off,
     /// Show DND status
     Status,
+}
+
+#[derive(Subcommand)]
+enum LogAction {
+    /// Record execution start, print row ID
+    Start {
+        /// Job ID
+        job_id: String,
+        /// Job name
+        job_name: String,
+    },
+    /// Record execution finish
+    Finish {
+        /// Row ID from start
+        row_id: i64,
+        /// Exit code
+        exit_code: i32,
+        /// Duration in milliseconds
+        duration_ms: i64,
+    },
+    /// Record a skipped execution
+    Skip {
+        /// Job ID
+        job_id: String,
+        /// Job name
+        job_name: String,
+        /// Reason for skipping
+        reason: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -178,6 +233,20 @@ fn main() -> Result<()> {
         Commands::Preview { cron, count, not_during } => cmd_preview(&cron, count, not_during),
         Commands::Sync => cmd_sync(),
         Commands::Check => cmd_check(),
+        Commands::History { job, failed, limit, json } => cmd_history(job, failed, limit, json),
+        Commands::Log { action } => match action {
+            LogAction::Start { job_id, job_name } => {
+                let row_id = history::record_start(&job_id, &job_name)?;
+                println!("{}", row_id);
+                Ok(())
+            }
+            LogAction::Finish { row_id, exit_code, duration_ms } => {
+                history::record_finish(row_id, exit_code, duration_ms)
+            }
+            LogAction::Skip { job_id, job_name, reason } => {
+                history::record_skip(&job_id, &job_name, &reason)
+            }
+        },
         Commands::Dnd { action } => match action {
             DndAction::Set { duration } => dnd::set_dnd(&duration),
             DndAction::Off => dnd::clear_dnd(),
@@ -559,6 +628,54 @@ fn format_duration(d: chrono::Duration) -> String {
         let hours = (total_mins % (60 * 24)) / 60;
         format!("in {}d {}h", days, hours)
     }
+}
+
+fn cmd_history(job: Option<String>, failed: bool, limit: usize, json: bool) -> Result<()> {
+    let executions = history::query_history(job.as_deref(), failed, limit)?;
+
+    if json {
+        let json_val: Vec<serde_json::Value> = executions
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "job_id": e.job_id,
+                    "job_name": e.job_name,
+                    "started_at": e.started_at.to_rfc3339(),
+                    "finished_at": e.finished_at.map(|t| t.to_rfc3339()),
+                    "exit_code": e.exit_code,
+                    "duration_ms": e.duration_ms,
+                    "skipped_reason": e.skipped_reason,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_val)?);
+    } else {
+        if let Some(ref j) = job {
+            println!("History for '{}':", j);
+            // Show stats
+            if let Ok((total, successes, skips, avg_dur)) = history::job_stats(j) {
+                let fail_count = total - successes;
+                let avg_str = avg_dur
+                    .map(|ms| {
+                        if ms < 1000.0 { format!("{:.0}ms", ms) }
+                        else if ms < 60_000.0 { format!("{:.1}s", ms / 1000.0) }
+                        else { format!("{:.0}m", ms / 60_000.0) }
+                    })
+                    .unwrap_or_else(|| "n/a".to_string());
+                println!(
+                    "  runs: {} | success: {} | failed: {} | skipped: {} | avg duration: {}",
+                    total, successes, fail_count, skips, avg_str
+                );
+            }
+            println!();
+        } else {
+            println!("Recent execution history:");
+            println!();
+        }
+        history::print_history(&executions);
+    }
+
+    Ok(())
 }
 
 fn cmd_sync() -> Result<()> {
