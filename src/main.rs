@@ -6,7 +6,7 @@ mod store;
 mod systemd;
 
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use clap::{Parser, Subcommand};
 
 use job::{Constraints, Job, Schedule, TimeRange};
@@ -78,6 +78,32 @@ enum Commands {
         id: String,
     },
 
+    /// Edit an existing job's schedule or constraints
+    Edit {
+        /// Job ID
+        id: String,
+
+        /// New cron expression
+        #[arg(long)]
+        cron: Option<String>,
+
+        /// New job name
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Replace not-during constraint (e.g., "22:00-08:00")
+        #[arg(long)]
+        not_during: Option<String>,
+
+        /// Clear not-during constraints
+        #[arg(long)]
+        clear_not_during: bool,
+
+        /// Set DND awareness
+        #[arg(long)]
+        dnd_aware: Option<bool>,
+    },
+
     /// Run a job immediately (for testing)
     Run {
         /// Job ID
@@ -87,8 +113,25 @@ enum Commands {
     /// Show upcoming scheduled runs
     Next,
 
-    /// Sync: verify and reconstruct missing timers
+    /// Preview when a cron expression would fire next
+    Preview {
+        /// Cron expression (e.g., "*/30 * * * *")
+        cron: String,
+
+        /// Number of future runs to show
+        #[arg(short = 'n', long, default_value = "5")]
+        count: usize,
+
+        /// Apply not-during constraint (e.g., "22:00-08:00")
+        #[arg(long)]
+        not_during: Option<String>,
+    },
+
+    /// Sync: verify and reconstruct missing timers, clean orphaned timers
     Sync,
+
+    /// Check health of all jobs and timers
+    Check,
 
     /// Manage Do Not Disturb mode
     Dnd {
@@ -125,11 +168,16 @@ fn main() -> Result<()> {
         } => cmd_add(name, cron, once, not_during, dnd_aware, remove_on_success, command),
         Commands::List { json } => cmd_list(json),
         Commands::Remove { id } => cmd_remove(&id),
+        Commands::Edit { id, cron, name, not_during, clear_not_during, dnd_aware } => {
+            cmd_edit(&id, cron, name, not_during, clear_not_during, dnd_aware)
+        }
         Commands::Enable { id } => cmd_enable(&id),
         Commands::Disable { id } => cmd_disable(&id),
         Commands::Run { id } => cmd_run(&id),
         Commands::Next => cmd_next(),
+        Commands::Preview { cron, count, not_during } => cmd_preview(&cron, count, not_during),
         Commands::Sync => cmd_sync(),
+        Commands::Check => cmd_check(),
         Commands::Dnd { action } => match action {
             DndAction::Set { duration } => dnd::set_dnd(&duration),
             DndAction::Off => dnd::clear_dnd(),
@@ -363,6 +411,156 @@ fn cmd_next() -> Result<()> {
     Ok(())
 }
 
+fn cmd_edit(
+    id: &str,
+    cron: Option<String>,
+    name: Option<String>,
+    not_during: Option<String>,
+    clear_not_during: bool,
+    dnd_aware: Option<bool>,
+) -> Result<()> {
+    let mut store = JobStore::load()?;
+
+    let job = store
+        .get_mut(id)
+        .ok_or_else(|| anyhow::anyhow!("Job '{}' not found", id))?;
+
+    let mut changes = Vec::new();
+
+    // Update name
+    if let Some(new_name) = name {
+        job.name = new_name.clone();
+        changes.push(format!("name → {}", new_name));
+    }
+
+    // Update DND awareness
+    if let Some(dnd) = dnd_aware {
+        job.constraints.dnd_aware = dnd;
+        changes.push(format!("dnd_aware → {}", dnd));
+    }
+
+    // Update not_during
+    if clear_not_during {
+        job.constraints.not_during.clear();
+        changes.push("not_during → cleared".to_string());
+    } else if let Some(nd) = not_during {
+        job.constraints.not_during = vec![TimeRange::parse(&nd)?];
+        changes.push(format!("not_during → {}", nd));
+    }
+
+    // Update cron schedule — this requires recreating the systemd timer
+    if let Some(new_cron) = cron {
+        match &job.schedule {
+            Schedule::Cron { .. } => {
+                // Remove old timer
+                if let Some(unit) = &job.systemd_unit {
+                    systemd::remove_timer(unit)?;
+                }
+
+                // Update schedule
+                job.schedule = Schedule::Cron { expr: new_cron.clone() };
+
+                // Create new timer with same job ID
+                let unit = systemd::create_timer(&job.id, &new_cron, &job.command)?;
+                job.systemd_unit = Some(unit);
+
+                changes.push(format!("cron → {}", new_cron));
+            }
+            Schedule::Once { .. } => {
+                anyhow::bail!("Cannot change a one-off job to cron. Remove and re-add instead.");
+            }
+        }
+    }
+
+    if changes.is_empty() {
+        println!("No changes specified for job '{}'", id);
+        return Ok(());
+    }
+
+    store.save()?;
+    println!("Updated job '{}':", id);
+    for change in &changes {
+        println!("  {}", change);
+    }
+
+    Ok(())
+}
+
+fn cmd_preview(cron_expr: &str, count: usize, not_during: Option<String>) -> Result<()> {
+    let constraint = not_during.as_ref().map(|nd| TimeRange::parse(nd)).transpose()?;
+
+    // The cron crate expects 6-7 fields (seconds first). Standard cron has 5 fields.
+    // Prepend "0" for seconds if we got a 5-field expression.
+    let full_cron = if cron_expr.split_whitespace().count() == 5 {
+        format!("0 {}", cron_expr)
+    } else {
+        cron_expr.to_string()
+    };
+
+    let schedule: cron::Schedule = full_cron.parse().map_err(|e| {
+        anyhow::anyhow!("Invalid cron expression {:?}: {}", cron_expr, e)
+    })?;
+
+    println!("Cron: {}", cron_expr);
+    if let Some(ref c) = constraint {
+        println!("Not during: {:?}-{:?}", c.start, c.end);
+    }
+    println!();
+
+    let mut shown = 0;
+    let now = chrono::Local::now();
+    let iter = schedule.upcoming(chrono::Local);
+
+    for next in iter.take(count * 3) {
+        if shown >= count {
+            break;
+        }
+
+        // Check not_during constraint
+        if let Some(ref c) = constraint {
+            let time = next.time();
+            let naive_time = chrono::NaiveTime::from_hms_opt(
+                time.hour() as u32,
+                time.minute() as u32,
+                0,
+            ).unwrap();
+            if c.contains(naive_time) {
+                continue;
+            }
+        }
+
+        shown += 1;
+        let delta = next - now;
+        let delta_str = format_duration(delta);
+        println!("  {}  ({})", next.format("%Y-%m-%d %H:%M %a"), delta_str);
+    }
+
+    if shown == 0 {
+        println!("  (no runs within the next {} candidates)", count * 3);
+    }
+
+    Ok(())
+}
+
+fn format_duration(d: chrono::Duration) -> String {
+    let total_mins = d.num_minutes();
+    if total_mins < 60 {
+        format!("in {} min", total_mins)
+    } else if total_mins < 60 * 24 {
+        let hours = total_mins / 60;
+        let mins = total_mins % 60;
+        if mins == 0 {
+            format!("in {}h", hours)
+        } else {
+            format!("in {}h {}m", hours, mins)
+        }
+    } else {
+        let days = total_mins / (60 * 24);
+        let hours = (total_mins % (60 * 24)) / 60;
+        format!("in {}d {}h", days, hours)
+    }
+}
+
 fn cmd_sync() -> Result<()> {
     let mut store = JobStore::load()?;
     let jobs: Vec<_> = store.list().iter().map(|j| (*j).clone()).collect();
@@ -370,16 +568,16 @@ fn cmd_sync() -> Result<()> {
     let mut fixed = 0;
     let mut ok = 0;
     let mut skipped = 0;
+    let mut orphans_cleaned = 0;
 
-    for job in jobs {
-        // Only sync recurring (cron) jobs - at jobs don't need syncing
+    // Phase 1: Ensure all jobs have working timers
+    for job in &jobs {
         if let Schedule::Cron { .. } = &job.schedule {
             let unit_name = job.systemd_unit.as_ref().map(|s| s.as_str()).unwrap_or("");
 
             if unit_name.is_empty() {
-                // Job has no systemd unit recorded, recreate it
                 println!("Recreating timer for '{}' (no unit recorded)...", job.id);
-                match systemd::recreate_timer(&job) {
+                match systemd::recreate_timer(job) {
                     Ok(new_unit) => {
                         if let Some(j) = store.get_mut(&job.id) {
                             j.systemd_unit = Some(new_unit.clone());
@@ -392,9 +590,8 @@ fn cmd_sync() -> Result<()> {
                     }
                 }
             } else if !systemd::verify_timer(unit_name) {
-                // Timer exists in job store but not in systemd
                 println!("Recreating missing timer for '{}' ({})...", job.id, unit_name);
-                match systemd::recreate_timer(&job) {
+                match systemd::recreate_timer(job) {
                     Ok(new_unit) => {
                         if let Some(j) = store.get_mut(&job.id) {
                             j.systemd_unit = Some(new_unit.clone());
@@ -414,10 +611,114 @@ fn cmd_sync() -> Result<()> {
         }
     }
 
+    // Phase 2: Clean orphaned timers (exist in systemd but not in jobs.json)
+    let known_units: std::collections::HashSet<String> = jobs
+        .iter()
+        .filter_map(|j| j.systemd_unit.clone())
+        .collect();
+
+    let orphaned = systemd::find_orphaned_timers(&known_units)?;
+    for orphan in &orphaned {
+        println!("Cleaning orphaned timer: {}", orphan);
+        if let Err(e) = systemd::remove_timer(orphan) {
+            eprintln!("  Failed to remove orphan '{}': {}", orphan, e);
+        } else {
+            orphans_cleaned += 1;
+        }
+    }
+
     store.save()?;
 
     println!();
-    println!("Sync complete: {} ok, {} fixed, {} skipped (one-off jobs)", ok, fixed, skipped);
+    println!(
+        "Sync complete: {} ok, {} fixed, {} orphans cleaned, {} skipped (one-off)",
+        ok, fixed, orphans_cleaned, skipped
+    );
+
+    Ok(())
+}
+
+fn cmd_check() -> Result<()> {
+    let store = JobStore::load()?;
+    let jobs = store.list();
+
+    if jobs.is_empty() {
+        println!("No jobs configured.");
+        return Ok(());
+    }
+
+    let mut errors = 0;
+
+    for job in &jobs {
+        let mut issues = Vec::new();
+
+        // Check if command binary exists
+        if !job.command.is_empty() {
+            let bin = &job.command[0];
+            let exists = std::process::Command::new("which")
+                .arg(bin)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            if !exists {
+                issues.push(format!("command '{}' not found in PATH", bin));
+            }
+        }
+
+        // Check systemd timer health for cron jobs
+        if let Schedule::Cron { .. } = &job.schedule {
+            match &job.systemd_unit {
+                Some(unit) => {
+                    if !systemd::verify_timer(unit) {
+                        issues.push(format!("timer '{}' not enabled/healthy", unit));
+                    }
+                }
+                None => {
+                    issues.push("no systemd unit recorded".to_string());
+                }
+            }
+        }
+
+        // Check for duplicate names
+        let name_count = jobs.iter().filter(|j| j.name == job.name).count();
+        if name_count > 1 {
+            issues.push(format!("duplicate name '{}' ({} jobs)", job.name, name_count));
+        }
+
+        // Print result
+        if issues.is_empty() {
+            println!("✓ {} ({})", job.id, job.name);
+        } else {
+            println!("✗ {} ({}):", job.id, job.name);
+            for issue in &issues {
+                println!("    - {}", issue);
+                errors += 1;
+            }
+        }
+    }
+
+    // Check for orphaned timers
+    let known_units: std::collections::HashSet<String> = jobs
+        .iter()
+        .filter_map(|j| j.systemd_unit.clone())
+        .collect();
+
+    let orphaned = systemd::find_orphaned_timers(&known_units)?;
+    if !orphaned.is_empty() {
+        println!();
+        println!("Orphaned timers ({}):", orphaned.len());
+        for orphan in &orphaned {
+            println!("  ✗ {} (not in jobs.json — run 'usched sync' to clean)", orphan);
+            errors += 1;
+        }
+    }
+
+    println!();
+    if errors == 0 {
+        println!("All checks passed.");
+    } else {
+        println!("{} issue(s) found. Run 'usched sync' to fix timer issues.", errors);
+    }
 
     Ok(())
 }

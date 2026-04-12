@@ -210,6 +210,31 @@ pub fn verify_timer(unit_name: &str) -> bool {
     }
 }
 
+/// Find systemd usched timers that aren't in the known units set (orphans).
+pub fn find_orphaned_timers(known_units: &std::collections::HashSet<String>) -> Result<Vec<String>> {
+    let systemd_dir = get_systemd_user_dir();
+    let mut orphaned = Vec::new();
+
+    if !systemd_dir.exists() {
+        return Ok(orphaned);
+    }
+
+    for entry in fs::read_dir(&systemd_dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        // Only check usched timer files
+        if name.starts_with("usched-") && name.ends_with(".timer") {
+            let unit_name = name.trim_end_matches(".timer").to_string();
+            if !known_units.contains(&unit_name) {
+                orphaned.push(unit_name);
+            }
+        }
+    }
+
+    Ok(orphaned)
+}
+
 /// Recreate a timer from job metadata.
 pub fn recreate_timer(job: &Job) -> Result<String> {
     if let crate::job::Schedule::Cron { expr } = &job.schedule {
