@@ -49,6 +49,10 @@ enum Commands {
         #[arg(long)]
         remove_on_success: bool,
 
+        /// Only run after this job succeeds (job ID or name)
+        #[arg(long)]
+        after: Option<String>,
+
         /// Command to run
         #[arg(last = true, required = true)]
         command: Vec<String>,
@@ -226,8 +230,9 @@ fn main() -> Result<()> {
             not_during,
             dnd_aware,
             remove_on_success,
+            after,
             command,
-        } => cmd_add(name, cron, once, not_during, dnd_aware, remove_on_success, command),
+        } => cmd_add(name, cron, once, not_during, dnd_aware, remove_on_success, after, command),
         Commands::List { json } => cmd_list(json),
         Commands::Remove { id } => cmd_remove(&id),
         Commands::Edit { id, cron, name, not_during, clear_not_during, dnd_aware } => {
@@ -270,10 +275,24 @@ fn cmd_add(
     not_during: Option<String>,
     dnd_aware: bool,
     remove_on_success: bool,
+    after: Option<String>,
     command: Vec<String>,
 ) -> Result<()> {
     if cron.is_none() && once.is_none() {
         anyhow::bail!("Must specify either --cron or --once");
+    }
+
+    // Validate --after dependency exists
+    if let Some(ref dep) = after {
+        let store = JobStore::load()?;
+        let dep_exists = store.get(dep).is_some()
+            || store.list().iter().any(|j| j.name == *dep);
+        if !dep_exists {
+            anyhow::bail!(
+                "Dependency job '{}' not found. Use a valid job ID or name.",
+                dep
+            );
+        }
     }
 
     let job_name = name.unwrap_or_else(|| command.first().cloned().unwrap_or_else(|| "job".to_string()));
@@ -294,6 +313,7 @@ fn cmd_add(
         only_during: vec![],
         dnd_aware,
         remove_on_success,
+        after,
     };
 
     let mut job = Job {
@@ -350,15 +370,18 @@ fn cmd_list(json: bool) -> Result<()> {
 
             let status = if job.enabled { "enabled" } else { "disabled" };
 
-            let mut flags = vec![];
+            let mut flags: Vec<String> = vec![];
             if job.constraints.dnd_aware {
-                flags.push("dnd-aware");
+                flags.push("dnd-aware".into());
             }
             if job.constraints.remove_on_success {
-                flags.push("auto-remove");
+                flags.push("auto-remove".into());
             }
             if !job.constraints.not_during.is_empty() {
-                flags.push("has-constraints");
+                flags.push("has-constraints".into());
+            }
+            if let Some(ref dep) = job.constraints.after {
+                flags.push(format!("after:{}", dep));
             }
 
             let flags_str = if flags.is_empty() {

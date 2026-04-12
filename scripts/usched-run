@@ -159,6 +159,29 @@ main() {
     local remove_on_success
     remove_on_success=$(echo "$job" | jq -r '.constraints.remove_on_success // false')
 
+    # Check 'after' dependency (job chaining)
+    local after_job
+    after_job=$(echo "$job" | jq -r '.constraints.after // empty')
+    if [[ -n "$after_job" ]]; then
+        # Check if the dependency job's last execution succeeded
+        local dep_last_exit
+        dep_last_exit=$(usched history "$after_job" -n 1 --json 2>/dev/null | jq -r '.[0].exit_code // empty')
+
+        if [[ -z "$dep_last_exit" ]]; then
+            log "Dependency job '$after_job' has no execution history, skipping job '$job_id'"
+            usched log skip "$job_id" "$job_name" "after: $after_job has no history" 2>/dev/null || true
+            exit 0
+        fi
+
+        if [[ "$dep_last_exit" != "0" ]]; then
+            log "Dependency job '$after_job' last exited with code $dep_last_exit, skipping job '$job_id'"
+            usched log skip "$job_id" "$job_name" "after: $after_job exit $dep_last_exit" 2>/dev/null || true
+            exit 0
+        fi
+
+        log "Dependency '$after_job' last succeeded, proceeding"
+    fi
+
     # All constraints passed, execute the command
     log "All constraints passed, executing: ${command[*]}"
 

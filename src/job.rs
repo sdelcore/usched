@@ -35,6 +35,9 @@ pub struct Constraints {
     /// Auto-remove this job when the command exits with success (exit code 0)
     #[serde(default)]
     pub remove_on_success: bool,
+    /// Only run after this job's last execution succeeded (job ID)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
