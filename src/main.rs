@@ -134,6 +134,13 @@ enum Commands {
     /// Check health of all jobs and timers
     Check,
 
+    /// Export schedule as markdown (for Obsidian/ARIA visibility)
+    Export {
+        /// Output file path (prints to stdout if omitted)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
     /// Show execution history
     History {
         /// Filter by job ID or name
@@ -233,6 +240,7 @@ fn main() -> Result<()> {
         Commands::Preview { cron, count, not_during } => cmd_preview(&cron, count, not_during),
         Commands::Sync => cmd_sync(),
         Commands::Check => cmd_check(),
+        Commands::Export { output } => cmd_export(output),
         Commands::History { job, failed, limit, json } => cmd_history(job, failed, limit, json),
         Commands::Log { action } => match action {
             LogAction::Start { job_id, job_name } => {
@@ -628,6 +636,90 @@ fn format_duration(d: chrono::Duration) -> String {
         let hours = (total_mins % (60 * 24)) / 60;
         format!("in {}d {}h", days, hours)
     }
+}
+
+fn cmd_export(output: Option<String>) -> Result<()> {
+    let store = JobStore::load()?;
+    let jobs = store.list();
+
+    let now = chrono::Local::now();
+    let mut md = String::new();
+
+    md.push_str(&format!(
+        "# Scheduled Tasks\n\n*Generated: {}*\n\n",
+        now.format("%Y-%m-%d %H:%M")
+    ));
+
+    md.push_str("| Job | Schedule | Status | Constraints |\n");
+    md.push_str("|-----|----------|--------|-------------|\n");
+
+    for job in &jobs {
+        let schedule_str = match &job.schedule {
+            Schedule::Cron { expr } => format!("`{}`", expr),
+            Schedule::Once { at } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
+        };
+
+        let status = if job.enabled { "enabled" } else { "disabled" };
+
+        let mut constraints = Vec::new();
+        if job.constraints.dnd_aware {
+            constraints.push("DND-aware".to_string());
+        }
+        for nd in &job.constraints.not_during {
+            constraints.push(format!("not {}-{}", nd.start.format("%H:%M"), nd.end.format("%H:%M")));
+        }
+        let constraints_str = if constraints.is_empty() {
+            "—".to_string()
+        } else {
+            constraints.join(", ")
+        };
+
+        md.push_str(&format!(
+            "| **{}** (`{}`) | {} | {} | {} |\n",
+            job.name, job.id, schedule_str, status, constraints_str
+        ));
+    }
+
+    // Add recent history
+    if let Ok(executions) = history::query_history(None, false, 10) {
+        if !executions.is_empty() {
+            md.push_str("\n## Recent Executions\n\n");
+            for exec in &executions {
+                let local_time: chrono::DateTime<chrono::Local> = exec.started_at.into();
+                let time_str = local_time.format("%Y-%m-%d %H:%M");
+
+                if let Some(ref reason) = exec.skipped_reason {
+                    md.push_str(&format!(
+                        "- {} **{}** — skipped ({})\n",
+                        time_str, exec.job_name, reason
+                    ));
+                } else {
+                    let status = match exec.exit_code {
+                        Some(0) => "✓".to_string(),
+                        Some(code) => format!("✗ exit {}", code),
+                        None => "running…".to_string(),
+                    };
+                    let dur = exec.duration_ms
+                        .map(|ms| if ms < 1000 { format!("{}ms", ms) } else { format!("{:.1}s", ms as f64 / 1000.0) })
+                        .unwrap_or_default();
+                    md.push_str(&format!(
+                        "- {} **{}** — {} {}\n",
+                        time_str, exec.job_name, status, dur
+                    ));
+                }
+            }
+        }
+    }
+
+    match output {
+        Some(path) => {
+            std::fs::write(&path, &md)?;
+            println!("Exported to {}", path);
+        }
+        None => print!("{}", md),
+    }
+
+    Ok(())
 }
 
 fn cmd_history(job: Option<String>, failed: bool, limit: usize, json: bool) -> Result<()> {
