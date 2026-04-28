@@ -96,4 +96,30 @@ mod tests {
         assert_eq!(parse_duration("1h30m").unwrap(), Duration::minutes(90));
         assert_eq!(parse_duration("90").unwrap(), Duration::minutes(90));
     }
+
+    #[test]
+    fn test_parse_duration_uppercase() {
+        assert_eq!(parse_duration("2H").unwrap(), Duration::hours(2));
+        assert_eq!(parse_duration("1H30M").unwrap(), Duration::minutes(90));
+    }
+
+    #[test]
+    fn test_parse_duration_whitespace() {
+        assert_eq!(parse_duration("  2h  ").unwrap(), Duration::hours(2));
+    }
+
+    #[test]
+    fn test_parse_duration_zero_errors() {
+        assert!(parse_duration("0").is_err());
+        assert!(parse_duration("0h").is_err());
+        assert!(parse_duration("0h0m").is_err());
+    }
+
+    #[test]
+    fn test_parse_duration_invalid() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
+        // Bare "h" — current_num is empty when we hit 'h'; "".parse::<i64>() errors
+        assert!(parse_duration("h").is_err());
+    }
 }

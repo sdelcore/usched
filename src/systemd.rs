@@ -23,18 +23,16 @@ pub fn create_timer(job_id: &str, cron_expr: &str, command: &[String]) -> Result
     let systemd_dir = get_systemd_user_dir();
     fs::create_dir_all(&systemd_dir)?;
 
-    // Build the command to run via usched-run wrapper
+    // Build ExecStart as systemd-quoted argv: <wrapper> <job_id> <args...>.
+    // No shell wrapping — usched-run is itself an executable script (shebang)
+    // and systemd's parser splits the line into argv, so each command arg is
+    // delivered intact regardless of its content.
     let wrapper_path = get_wrapper_path();
-    let full_command = format!(
-        "{} {} {}",
-        wrapper_path,
-        job_id,
-        command
-            .iter()
-            .map(|s| shell_escape(s))
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
+    let exec_start = std::iter::once(systemd_quote(&wrapper_path))
+        .chain(std::iter::once(systemd_quote(job_id)))
+        .chain(command.iter().map(|s| systemd_quote(s)))
+        .collect::<Vec<_>>()
+        .join(" ");
 
     // Capture current PATH for the service environment
     let path_env = std::env::var("PATH").unwrap_or_default();
@@ -59,9 +57,6 @@ WantedBy=timers.target
         timer_content,
     )?;
 
-    // Resolve bash path (NixOS doesn't have /bin/bash)
-    let bash_path = get_bash_path();
-
     // Write .service file
     let service_content = format!(
         r#"[Unit]
@@ -70,7 +65,7 @@ Description=usched job: {job_id}
 [Service]
 Type=oneshot
 Environment="PATH={path_env}"
-ExecStart={bash_path} -c '{full_command}'
+ExecStart={exec_start}
 "#
     );
     fs::write(
@@ -244,25 +239,6 @@ pub fn recreate_timer(job: &Job) -> Result<String> {
     }
 }
 
-/// Resolve the absolute path to bash.
-/// On NixOS, /bin/bash doesn't exist so we need to find it dynamically.
-fn get_bash_path() -> String {
-    if let Ok(output) = std::process::Command::new("which")
-        .arg("bash")
-        .output()
-    {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return path;
-            }
-        }
-    }
-
-    // Fallback for standard Linux
-    "/bin/bash".to_string()
-}
-
 fn get_wrapper_path() -> String {
     // Look for usched-run in the data directory
     let data_dir = get_data_dir();
@@ -296,10 +272,77 @@ fn get_wrapper_path() -> String {
     "usched-run".to_string()
 }
 
-fn shell_escape(s: &str) -> String {
-    if s.contains(' ') || s.contains('\'') || s.contains('"') || s.contains('$') {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    } else {
-        s.to_string()
+/// Quote a string for use as one argv element in a systemd ExecStart line.
+///
+/// Per systemd.exec(5), arguments are split on unquoted whitespace and may be
+/// wrapped in double quotes to preserve them as a single argument. Inside
+/// double quotes, `\` and `"` need to be backslash-escaped, `$` becomes `$$`
+/// (otherwise systemd treats `$VAR` as env-variable expansion), and `%`
+/// becomes `%%` (otherwise systemd treats `%h`, `%u`, etc. as specifiers).
+///
+/// Strings without any special characters are returned as-is.
+fn systemd_quote(s: &str) -> String {
+    let needs_quote = s.is_empty()
+        || s.chars().any(|c| {
+            c.is_whitespace()
+                || matches!(c, '"' | '\\' | '\'' | '$' | '%' | '`' | ';' | '&' | '|')
+        });
+    if !needs_quote {
+        return s.to_string();
+    }
+    // Order matters: escape backslashes first so we don't double-escape ones
+    // we add when escaping `"`.
+    let escaped = s
+        .replace('\\', r"\\")
+        .replace('"', "\\\"")
+        .replace('$', "$$")
+        .replace('%', "%%");
+    format!("\"{}\"", escaped)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_plain() {
+        assert_eq!(systemd_quote("plain"), "plain");
+        assert_eq!(systemd_quote("/usr/bin/touch"), "/usr/bin/touch");
+        assert_eq!(systemd_quote("--cron"), "--cron");
+    }
+
+    #[test]
+    fn quote_whitespace() {
+        assert_eq!(systemd_quote("with space"), "\"with space\"");
+        assert_eq!(systemd_quote("a\tb"), "\"a\tb\"");
+    }
+
+    #[test]
+    fn quote_special_chars() {
+        // Single quotes force double-quote wrapping
+        assert_eq!(systemd_quote("it's"), "\"it's\"");
+        // Embedded double quote
+        assert_eq!(systemd_quote(r#"a"b"#), "\"a\\\"b\"");
+        // Backslash
+        assert_eq!(systemd_quote(r"a\b"), r#""a\\b""#);
+        // Dollar — systemd would expand $VAR otherwise
+        assert_eq!(systemd_quote("$VAR"), "\"$$VAR\"");
+        // Percent — specifier expansion
+        assert_eq!(systemd_quote("100%done"), "\"100%%done\"");
+    }
+
+    #[test]
+    fn quote_empty() {
+        assert_eq!(systemd_quote(""), "\"\"");
+    }
+
+    #[test]
+    fn quote_realistic_shell_command() {
+        // The exact case that exposed the bug: a quoted shell command passed
+        // as a single argv element.
+        assert_eq!(
+            systemd_quote("echo fired > /home/testuser/marker"),
+            "\"echo fired > /home/testuser/marker\""
+        );
     }
 }

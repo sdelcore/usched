@@ -174,3 +174,93 @@ fn parse_at_job_number(output: &str) -> Option<String> {
 }
 
 use chrono::TimeZone;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_in_hours() {
+        let now = Local::now();
+        let parsed = parse_datetime("in 2 hours").unwrap();
+        let delta = parsed - now.with_timezone(&Utc);
+        // Allow a couple-second drift between Local::now() calls
+        assert!(delta.num_seconds() >= 7195 && delta.num_seconds() <= 7205);
+    }
+
+    #[test]
+    fn test_parse_in_one_hour() {
+        let now = Local::now();
+        let parsed = parse_datetime("in 1 hour").unwrap();
+        let delta = parsed - now.with_timezone(&Utc);
+        assert!(delta.num_seconds() >= 3595 && delta.num_seconds() <= 3605);
+    }
+
+    #[test]
+    fn test_parse_in_minutes() {
+        let now = Local::now();
+        let parsed = parse_datetime("in 30 minutes").unwrap();
+        let delta = parsed - now.with_timezone(&Utc);
+        assert!(delta.num_seconds() >= 1795 && delta.num_seconds() <= 1805);
+    }
+
+    #[test]
+    fn test_parse_in_min_alias() {
+        let parsed = parse_datetime("in 5 min");
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn test_parse_tomorrow() {
+        let parsed = parse_datetime("tomorrow 14:00").unwrap();
+        let local = parsed.with_timezone(&Local);
+        let tomorrow = Local::now().date_naive() + chrono::Duration::days(1);
+        assert_eq!(local.date_naive(), tomorrow);
+        assert_eq!(local.format("%H:%M").to_string(), "14:00");
+    }
+
+    #[test]
+    fn test_parse_absolute() {
+        // Use a date well in the future so the test is timezone-stable
+        let parsed = parse_datetime("2099-06-15 09:30").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(local.format("%Y-%m-%d %H:%M").to_string(), "2099-06-15 09:30");
+    }
+
+    #[test]
+    fn test_parse_hhmm_today_or_tomorrow() {
+        // If "23:59" is in the future today, scheduled for today; otherwise tomorrow.
+        let parsed = parse_datetime("23:59").unwrap();
+        let now = Local::now();
+        let scheduled = parsed.with_timezone(&Local);
+        assert!(scheduled > now);
+        assert_eq!(scheduled.format("%H:%M").to_string(), "23:59");
+    }
+
+    #[test]
+    fn test_parse_invalid() {
+        assert!(parse_datetime("garbage").is_err());
+        assert!(parse_datetime("").is_err());
+        assert!(parse_datetime("in two hours").is_err());
+        assert!(parse_datetime("tomorrow notatime").is_err());
+    }
+
+    #[test]
+    fn test_parse_at_job_number_typical() {
+        let out = "warning: commands will be executed using /bin/sh\njob 17 at Thu Jan 16 14:00:00 2025\n";
+        assert_eq!(parse_at_job_number(out), Some("17".to_string()));
+    }
+
+    #[test]
+    fn test_parse_at_job_number_missing() {
+        assert_eq!(parse_at_job_number("nothing here"), None);
+    }
+
+    #[test]
+    fn test_shell_escape() {
+        assert_eq!(shell_escape("plain"), "plain");
+        assert_eq!(shell_escape("with space"), "'with space'");
+        assert_eq!(shell_escape("$var"), "'$var'");
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+}

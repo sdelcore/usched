@@ -189,4 +189,57 @@ mod tests {
             "*-*-* 08..22:00,30"
         );
     }
+
+    #[test]
+    fn test_invalid_field_count() {
+        assert!(cron_to_oncalendar("0 9 * *").is_err());
+        assert!(cron_to_oncalendar("0 9 * * * *").is_err());
+        assert!(cron_to_oncalendar("").is_err());
+    }
+
+    #[test]
+    fn test_single_dow() {
+        assert_eq!(
+            cron_to_oncalendar("0 9 * * 0").unwrap(),
+            "Sun *-*-* 09:00"
+        );
+        assert_eq!(
+            cron_to_oncalendar("0 9 * * 6").unwrap(),
+            "Sat *-*-* 09:00"
+        );
+    }
+
+    #[test]
+    fn test_dow_list() {
+        assert_eq!(
+            cron_to_oncalendar("0 9 * * 1,3,5").unwrap(),
+            "Mon,Wed,Fri *-*-* 09:00"
+        );
+    }
+
+    #[test]
+    fn test_step_in_hour() {
+        // every 4 hours
+        assert_eq!(
+            cron_to_oncalendar("0 */4 * * *").unwrap(),
+            "*-*-* 00,04,08,12,16,20:00"
+        );
+    }
+
+    #[test]
+    fn test_specific_date() {
+        assert_eq!(
+            cron_to_oncalendar("0 9 15 6 *").unwrap(),
+            "*-06-15 09:00"
+        );
+    }
+
+    #[test]
+    fn test_day_wildcard_with_month() {
+        // Day "*" should remain "*" not "00"
+        assert_eq!(
+            cron_to_oncalendar("0 9 * 6 *").unwrap(),
+            "*-06-* 09:00"
+        );
+    }
 }
