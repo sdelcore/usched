@@ -37,7 +37,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build e2e image
-        run: docker build -t usched-e2e:ci -f tests/e2e/Dockerfile .
+        run: docker build --target e2e -t usched-e2e:ci .
 
       - name: Run e2e container
         # Privileged + cgroup ns + cgroup bind mount is the canonical recipe

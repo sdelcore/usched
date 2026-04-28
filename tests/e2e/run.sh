@@ -9,7 +9,7 @@ cd "$ROOT"
 IMAGE="usched-e2e:local"
 
 echo "==> docker build"
-docker build -t "$IMAGE" -f tests/e2e/Dockerfile .
+docker build --target e2e -t "$IMAGE" .
 
 echo "==> docker run"
 # --privileged + cgroup mounts + tmpfs are the canonical recipe for systemd in docker.
