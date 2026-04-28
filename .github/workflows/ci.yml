@@ -19,15 +19,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: DeterminateSystems/nix-installer-action@main
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: DeterminateSystems/magic-nix-cache-action@main
 
       - name: cargo build
-        run: cargo build --locked
+        run: nix develop --command cargo build --locked
 
       - name: cargo test (unit + CLI integration)
-        run: cargo test --locked
+        run: nix develop --command cargo test --locked
 
   e2e:
     name: Docker systemd e2e
