@@ -1,0 +1,14 @@
+[Unit]
+Description=usched e2e test runner
+After=multi-user.target user@1000.service atd.service
+Wants=user@1000.service atd.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/run-tests.sh
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

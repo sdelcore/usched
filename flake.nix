@@ -33,6 +33,8 @@
           packages = with pkgs; [
             rustc
             cargo
+            rustfmt
+            clippy
             rust-analyzer
             jq  # Required by usched-run
           ];

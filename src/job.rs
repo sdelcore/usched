@@ -76,3 +76,79 @@ impl Job {
         format!("{}-{}", name, suffix)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn t(h: u32, m: u32) -> NaiveTime {
+        NaiveTime::from_hms_opt(h, m, 0).unwrap()
+    }
+
+    #[test]
+    fn time_range_parse_ok() {
+        let r = TimeRange::parse("09:00-17:00").unwrap();
+        assert_eq!(r.start, t(9, 0));
+        assert_eq!(r.end, t(17, 0));
+    }
+
+    #[test]
+    fn time_range_parse_invalid() {
+        assert!(TimeRange::parse("9-17").is_err());
+        assert!(TimeRange::parse("09:00").is_err());
+        assert!(TimeRange::parse("25:00-26:00").is_err());
+        assert!(TimeRange::parse("").is_err());
+    }
+
+    #[test]
+    fn time_range_normal_contains() {
+        let r = TimeRange::parse("09:00-17:00").unwrap();
+        assert!(r.contains(t(12, 0)));
+        assert!(r.contains(t(9, 0)));
+        assert!(!r.contains(t(17, 0))); // end-exclusive
+        assert!(!r.contains(t(8, 59)));
+        assert!(!r.contains(t(18, 0)));
+    }
+
+    #[test]
+    fn time_range_midnight_wrap_contains() {
+        // 22:00-08:00 covers late night through early morning
+        let r = TimeRange::parse("22:00-08:00").unwrap();
+        assert!(r.contains(t(23, 0)));
+        assert!(r.contains(t(0, 0)));
+        assert!(r.contains(t(7, 59)));
+        assert!(r.contains(t(22, 0)));
+        assert!(!r.contains(t(8, 0))); // end-exclusive
+        assert!(!r.contains(t(12, 0)));
+        assert!(!r.contains(t(21, 59)));
+    }
+
+    #[test]
+    fn generate_id_contains_name() {
+        let id = Job::generate_id("morning-check");
+        assert!(id.starts_with("morning-check-"));
+        // suffix is 6 hex chars
+        let suffix = id.strip_prefix("morning-check-").unwrap();
+        assert_eq!(suffix.len(), 6);
+    }
+
+    #[test]
+    fn generate_id_unique() {
+        let a = Job::generate_id("x");
+        let b = Job::generate_id("x");
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn schedule_serde_roundtrip_cron() {
+        let s = Schedule::Cron { expr: "0 9 * * *".into() };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"type\":\"cron\""));
+        assert!(json.contains("\"expr\":\"0 9 * * *\""));
+        let back: Schedule = serde_json::from_str(&json).unwrap();
+        match back {
+            Schedule::Cron { expr } => assert_eq!(expr, "0 9 * * *"),
+            _ => panic!("wrong variant"),
+        }
+    }
+}
