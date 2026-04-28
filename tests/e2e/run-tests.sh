@@ -27,11 +27,9 @@ for i in $(seq 1 60); do
 done
 
 section "smoke: schedule cron job"
-# Use a command with no shell metacharacters: `touch <abs-path>`. usched's unit
-# generation has a known shell-quoting issue when an argv element contains
-# spaces or quotes (it wraps the full command in `bash -c '...'`, which breaks
-# inner single quotes); plain `touch` avoids that surface entirely.
-if as_user usched add --name e2e-cron --cron "* * * * *" -- /usr/bin/touch /home/testuser/marker; then
+# Uses a /bin/sh -c command with shell metacharacters (redirection, spaces) —
+# this was the case that exposed the unit-file quoting bug.
+if as_user usched add --name e2e-cron --cron "* * * * *" -- /bin/sh -c 'echo fired > /home/testuser/marker'; then
     ok "usched add --cron"
 else
     ng "usched add --cron"
