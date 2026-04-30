@@ -1,16 +1,19 @@
 mod at;
+mod backend;
 mod cron_convert;
 mod dnd;
 pub mod history;
 mod job;
+mod runner;
 pub mod store;
 mod systemd;
+mod time_input;
 
 use anyhow::Result;
 use chrono::{Timelike, Utc};
 use clap::{Parser, Subcommand};
 
-use job::{Constraints, Job, Schedule, TimeRange};
+use job::{Constraints, Job, Schedule};
 use store::JobStore;
 
 #[derive(Parser)]
@@ -109,10 +112,26 @@ enum Commands {
         dnd_aware: Option<bool>,
     },
 
-    /// Run a job immediately (for testing)
+    /// Run a job immediately, honoring constraints
     Run {
         /// Job ID
         id: String,
+
+        /// Bypass constraint checks (DND, time ranges, --after, enabled)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Internal: invoked by systemd/at to actually execute a scheduled job.
+    /// Reads the command from jobs.json and applies all runtime constraints.
+    #[command(name = "__run-job", hide = true)]
+    RunJob {
+        /// Job ID
+        job_id: String,
+
+        /// Legacy positional args from old `usched-run <id> <cmd...>` callers; ignored.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
+        _legacy: Vec<String>,
     },
 
     /// Show upcoming scheduled runs
@@ -163,13 +182,6 @@ enum Commands {
         json: bool,
     },
 
-    /// Record a job execution (used by usched-run wrapper)
-    #[command(hide = true)]
-    Log {
-        #[command(subcommand)]
-        action: LogAction,
-    },
-
     /// Manage Do Not Disturb mode
     Dnd {
         #[command(subcommand)]
@@ -188,35 +200,6 @@ enum DndAction {
     Off,
     /// Show DND status
     Status,
-}
-
-#[derive(Subcommand)]
-enum LogAction {
-    /// Record execution start, print row ID
-    Start {
-        /// Job ID
-        job_id: String,
-        /// Job name
-        job_name: String,
-    },
-    /// Record execution finish
-    Finish {
-        /// Row ID from start
-        row_id: i64,
-        /// Exit code
-        exit_code: i32,
-        /// Duration in milliseconds
-        duration_ms: i64,
-    },
-    /// Record a skipped execution
-    Skip {
-        /// Job ID
-        job_id: String,
-        /// Job name
-        job_name: String,
-        /// Reason for skipping
-        reason: String,
-    },
 }
 
 fn main() -> Result<()> {
@@ -240,26 +223,14 @@ fn main() -> Result<()> {
         }
         Commands::Enable { id } => cmd_enable(&id),
         Commands::Disable { id } => cmd_disable(&id),
-        Commands::Run { id } => cmd_run(&id),
+        Commands::Run { id, force } => cmd_run(&id, force),
+        Commands::RunJob { job_id, .. } => cmd_run_job(&job_id),
         Commands::Next => cmd_next(),
         Commands::Preview { cron, count, not_during } => cmd_preview(&cron, count, not_during),
         Commands::Sync => cmd_sync(),
         Commands::Check => cmd_check(),
         Commands::Export { output } => cmd_export(output),
         Commands::History { job, failed, limit, json } => cmd_history(job, failed, limit, json),
-        Commands::Log { action } => match action {
-            LogAction::Start { job_id, job_name } => {
-                let row_id = history::record_start(&job_id, &job_name)?;
-                println!("{}", row_id);
-                Ok(())
-            }
-            LogAction::Finish { row_id, exit_code, duration_ms } => {
-                history::record_finish(row_id, exit_code, duration_ms)
-            }
-            LogAction::Skip { job_id, job_name, reason } => {
-                history::record_skip(&job_id, &job_name, &reason)
-            }
-        },
         Commands::Dnd { action } => match action {
             DndAction::Set { duration } => dnd::set_dnd(&duration),
             DndAction::Off => dnd::clear_dnd(),
@@ -299,15 +270,15 @@ fn cmd_add(
     let job_id = Job::generate_id(&job_name);
 
     let schedule = if let Some(cron_expr) = &cron {
-        Schedule::Cron { expr: cron_expr.clone() }
+        Schedule::Cron { expr: cron_expr.clone(), unit: None }
     } else {
-        let at_time = at::parse_datetime(once.as_ref().unwrap())?;
-        Schedule::Once { at: at_time }
+        let at_time = time_input::parse_datetime(once.as_ref().unwrap())?;
+        Schedule::Once { at: at_time, at_job: None }
     };
 
     let constraints = Constraints {
         not_during: match not_during {
-            Some(s) => vec![TimeRange::parse(&s)?],
+            Some(s) => vec![time_input::parse_time_range(&s)?],
             None => vec![],
         },
         only_during: vec![],
@@ -319,29 +290,25 @@ fn cmd_add(
     let mut job = Job {
         id: job_id.clone(),
         name: job_name,
-        schedule: schedule.clone(),
-        command: command.clone(),
+        schedule,
+        command,
         constraints,
         enabled: true,
         created_at: Utc::now(),
         created_by: "user".to_string(),
-        systemd_unit: None,
-        at_job: None,
     };
 
-    // Schedule the job
-    match &schedule {
-        Schedule::Cron { expr } => {
-            let unit = systemd::create_timer(&job_id, expr, &command)?;
-            job.systemd_unit = Some(unit.clone());
-            println!("Created recurring job '{}' with systemd timer '{}'", job_id, unit);
+    let backend = job.schedule.backend();
+    let handle = backend.schedule(&job)?;
+    match &job.schedule {
+        Schedule::Cron { .. } => {
+            println!("Created recurring job '{}' with systemd timer '{}'", job_id, handle);
         }
-        Schedule::Once { at } => {
-            let job_num = at::schedule_at(&job_id, *at, &command)?;
-            job.at_job = Some(job_num.clone());
-            println!("Created one-off job '{}' with at job #{}", job_id, job_num);
+        Schedule::Once { .. } => {
+            println!("Created one-off job '{}' with at job #{}", job_id, handle);
         }
     }
+    job.schedule.set_handle(handle);
 
     let mut store = JobStore::load()?;
     store.add(job);
@@ -364,8 +331,8 @@ fn cmd_list(json: bool) -> Result<()> {
 
         for job in jobs {
             let schedule_str = match &job.schedule {
-                Schedule::Cron { expr } => format!("cron: {}", expr),
-                Schedule::Once { at } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
+                Schedule::Cron { expr, .. } => format!("cron: {}", expr),
+                Schedule::Once { at, .. } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
             };
 
             let status = if job.enabled { "enabled" } else { "disabled" };
@@ -406,19 +373,11 @@ fn cmd_remove(id: &str) -> Result<()> {
 
     let job = store.remove(id).ok_or_else(|| anyhow::anyhow!("Job '{}' not found", id))?;
 
-    // Clean up the underlying scheduler
-    match &job.schedule {
-        Schedule::Cron { .. } => {
-            if let Some(unit) = &job.systemd_unit {
-                systemd::remove_timer(unit)?;
-                println!("Removed systemd timer '{}'", unit);
-            }
-        }
-        Schedule::Once { .. } => {
-            if let Some(job_num) = &job.at_job {
-                at::remove_at(job_num)?;
-                println!("Removed at job #{}", job_num);
-            }
+    if let Some(handle) = job.schedule.handle() {
+        job.schedule.backend().remove(handle)?;
+        match &job.schedule {
+            Schedule::Cron { .. } => println!("Removed systemd timer '{}'", handle),
+            Schedule::Once { .. } => println!("Removed at job #{}", handle),
         }
     }
 
@@ -438,8 +397,8 @@ fn cmd_enable(id: &str) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(unit) = &job.systemd_unit {
-        systemd::enable_timer(unit)?;
+    if let Some(handle) = job.schedule.handle() {
+        job.schedule.backend().enable(handle)?;
     }
 
     job.enabled = true;
@@ -459,8 +418,8 @@ fn cmd_disable(id: &str) -> Result<()> {
         return Ok(());
     }
 
-    if let Some(unit) = &job.systemd_unit {
-        systemd::disable_timer(unit)?;
+    if let Some(handle) = job.schedule.handle() {
+        job.schedule.backend().disable(handle)?;
     }
 
     job.enabled = false;
@@ -470,24 +429,22 @@ fn cmd_disable(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_run(id: &str) -> Result<()> {
-    let store = JobStore::load()?;
-
-    let job = store.get(id).ok_or_else(|| anyhow::anyhow!("Job '{}' not found", id))?;
-
-    println!("Running job '{}': {}", id, job.command.join(" "));
-
-    let status = std::process::Command::new(&job.command[0])
-        .args(&job.command[1..])
-        .status()?;
-
-    if status.success() {
+fn cmd_run(id: &str, force: bool) -> Result<()> {
+    let exit_code = runner::run(id, force)?;
+    if exit_code == 0 {
         println!("Job completed successfully");
     } else {
-        println!("Job failed with exit code: {:?}", status.code());
+        println!("Job failed with exit code: {}", exit_code);
     }
-
     Ok(())
+}
+
+/// Hidden subcommand invoked by systemd timers and `at` queue entries.
+/// Propagates the child's exit code to the caller (so systemd can mark
+/// the service unit as failed when appropriate).
+fn cmd_run_job(job_id: &str) -> Result<()> {
+    let exit_code = runner::run(job_id, false)?;
+    std::process::exit(exit_code);
 }
 
 fn cmd_next() -> Result<()> {
@@ -544,25 +501,22 @@ fn cmd_edit(
         job.constraints.not_during.clear();
         changes.push("not_during → cleared".to_string());
     } else if let Some(nd) = not_during {
-        job.constraints.not_during = vec![TimeRange::parse(&nd)?];
+        job.constraints.not_during = vec![time_input::parse_time_range(&nd)?];
         changes.push(format!("not_during → {}", nd));
     }
 
     // Update cron schedule — this requires recreating the systemd timer
     if let Some(new_cron) = cron {
         match &job.schedule {
-            Schedule::Cron { .. } => {
-                // Remove old timer
-                if let Some(unit) = &job.systemd_unit {
-                    systemd::remove_timer(unit)?;
+            Schedule::Cron { unit, .. } => {
+                let backend = backend::Backend::Systemd;
+                if let Some(handle) = unit {
+                    backend.remove(handle)?;
                 }
 
-                // Update schedule
-                job.schedule = Schedule::Cron { expr: new_cron.clone() };
-
-                // Create new timer with same job ID
-                let unit = systemd::create_timer(&job.id, &new_cron, &job.command)?;
-                job.systemd_unit = Some(unit);
+                job.schedule = Schedule::Cron { expr: new_cron.clone(), unit: None };
+                let new_handle = backend.schedule(job)?;
+                job.schedule.set_handle(new_handle);
 
                 changes.push(format!("cron → {}", new_cron));
             }
@@ -587,7 +541,7 @@ fn cmd_edit(
 }
 
 fn cmd_preview(cron_expr: &str, count: usize, not_during: Option<String>) -> Result<()> {
-    let constraint = not_during.as_ref().map(|nd| TimeRange::parse(nd)).transpose()?;
+    let constraint = not_during.as_ref().map(|nd| time_input::parse_time_range(nd)).transpose()?;
 
     // The cron crate expects 6-7 fields (seconds first). Standard cron has 5 fields.
     // Prepend "0" for seconds if we got a 5-field expression.
@@ -678,8 +632,8 @@ fn cmd_export(output: Option<String>) -> Result<()> {
 
     for job in &jobs {
         let schedule_str = match &job.schedule {
-            Schedule::Cron { expr } => format!("`{}`", expr),
-            Schedule::Once { at } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
+            Schedule::Cron { expr, .. } => format!("`{}`", expr),
+            Schedule::Once { at, .. } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
         };
 
         let status = if job.enabled { "enabled" } else { "disabled" };
@@ -805,38 +759,35 @@ fn cmd_sync() -> Result<()> {
     // Phase 1: Ensure all jobs have working timers
     for job in &jobs {
         if let Schedule::Cron { .. } = &job.schedule {
-            let unit_name = job.systemd_unit.as_ref().map(|s| s.as_str()).unwrap_or("");
+            let unit_name = job.schedule.handle().unwrap_or("");
 
-            if unit_name.is_empty() {
-                println!("Recreating timer for '{}' (no unit recorded)...", job.id);
-                match systemd::recreate_timer(job) {
-                    Ok(new_unit) => {
-                        if let Some(j) = store.get_mut(&job.id) {
-                            j.systemd_unit = Some(new_unit.clone());
-                        }
-                        println!("  Created: {}", new_unit);
-                        fixed += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
-                    }
-                }
+            let needs_rewrite = if unit_name.is_empty() {
+                Some("no unit recorded")
             } else if !systemd::verify_timer(unit_name) {
-                println!("Recreating missing timer for '{}' ({})...", job.id, unit_name);
-                match systemd::recreate_timer(job) {
-                    Ok(new_unit) => {
-                        if let Some(j) = store.get_mut(&job.id) {
-                            j.systemd_unit = Some(new_unit.clone());
+                Some("missing timer")
+            } else if systemd::timer_is_legacy(unit_name) {
+                Some("legacy ExecStart format")
+            } else {
+                None
+            };
+
+            match needs_rewrite {
+                None => ok += 1,
+                Some(reason) => {
+                    println!("Rewriting timer for '{}' ({})...", job.id, reason);
+                    match systemd::recreate_timer(job) {
+                        Ok(new_unit) => {
+                            if let Some(j) = store.get_mut(&job.id) {
+                                j.schedule.set_handle(new_unit.clone());
+                            }
+                            println!("  Wrote: {}", new_unit);
+                            fixed += 1;
                         }
-                        println!("  Recreated: {}", new_unit);
-                        fixed += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
+                        Err(e) => {
+                            eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
+                        }
                     }
                 }
-            } else {
-                ok += 1;
             }
         } else {
             skipped += 1;
@@ -846,7 +797,7 @@ fn cmd_sync() -> Result<()> {
     // Phase 2: Clean orphaned timers (exist in systemd but not in jobs.json)
     let known_units: std::collections::HashSet<String> = jobs
         .iter()
-        .filter_map(|j| j.systemd_unit.clone())
+        .filter_map(|j| j.schedule.handle().map(|h| h.to_string()))
         .collect();
 
     let orphaned = systemd::find_orphaned_timers(&known_units)?;
@@ -897,12 +848,12 @@ fn cmd_check() -> Result<()> {
             }
         }
 
-        // Check systemd timer health for cron jobs
+        // Check timer health via the owning backend
         if let Schedule::Cron { .. } = &job.schedule {
-            match &job.systemd_unit {
-                Some(unit) => {
-                    if !systemd::verify_timer(unit) {
-                        issues.push(format!("timer '{}' not enabled/healthy", unit));
+            match job.schedule.handle() {
+                Some(handle) => {
+                    if !job.schedule.backend().verify(handle) {
+                        issues.push(format!("timer '{}' not enabled/healthy", handle));
                     }
                 }
                 None => {
@@ -932,7 +883,7 @@ fn cmd_check() -> Result<()> {
     // Check for orphaned timers
     let known_units: std::collections::HashSet<String> = jobs
         .iter()
-        .filter_map(|j| j.systemd_unit.clone())
+        .filter_map(|j| j.schedule.handle().map(|h| h.to_string()))
         .collect();
 
     let orphaned = systemd::find_orphaned_timers(&known_units)?;
