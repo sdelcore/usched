@@ -1,7 +1,8 @@
 //! Execution history stored in SQLite.
 //!
 //! Records when jobs ran, how long they took, and whether they succeeded.
-//! Used by `usched history` and the `usched-run` wrapper script.
+//! Written by the [`runner`](crate::runner) module; queried by the
+//! `usched history` subcommand.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local, Utc};

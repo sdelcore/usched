@@ -36,7 +36,7 @@
             rustfmt
             clippy
             rust-analyzer
-            jq  # Required by usched-run
+            jq
           ];
         };
       });

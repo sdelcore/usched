@@ -325,24 +325,40 @@ fn disable_then_enable_toggles_state() {
         .stdout(predicate::str::contains("Enabled"));
 }
 
-#[test]
-fn history_log_start_finish_records_execution() {
-    let sb = Sandbox::new();
-    let out = sb
-        .cmd()
-        .args(["log", "start", "job-abc", "myjob"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let row_id = String::from_utf8(out).unwrap().trim().to_string();
-    assert!(row_id.parse::<i64>().is_ok(), "row_id: {}", row_id);
+/// Helper: pull the freshly-added job id out of `usched list` output.
+fn first_job_id_with_prefix(sb: &Sandbox, prefix: &str) -> String {
+    let listing = String::from_utf8(
+        sb.cmd()
+            .args(["list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    listing
+        .lines()
+        .find_map(|l| {
+            l.split_whitespace()
+                .next()
+                .filter(|p| p.starts_with(prefix))
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| panic!("no job id with prefix {:?} in:\n{}", prefix, listing))
+}
 
+#[test]
+fn runjob_executes_command_and_records_history() {
+    let sb = Sandbox::new();
     sb.cmd()
-        .args(["log", "finish", &row_id, "0", "123"])
+        .args(["add", "--name", "exec", "--cron", "0 9 * * *", "--", "true"])
         .assert()
         .success();
+
+    let id = first_job_id_with_prefix(&sb, "exec-");
+
+    sb.cmd().args(["__run-job", &id]).assert().success();
 
     let history_out = sb
         .cmd()
@@ -356,18 +372,22 @@ fn history_log_start_finish_records_execution() {
         serde_json::from_str(&String::from_utf8(history_out).unwrap()).unwrap();
     let arr = parsed.as_array().unwrap();
     assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["job_id"], "job-abc");
+    assert_eq!(arr[0]["job_id"], id);
     assert_eq!(arr[0]["exit_code"], 0);
-    assert_eq!(arr[0]["duration_ms"], 123);
 }
 
 #[test]
-fn history_skip_records_reason() {
+fn runjob_skips_disabled_job() {
     let sb = Sandbox::new();
     sb.cmd()
-        .args(["log", "skip", "job-x", "x", "dnd"])
+        .args(["add", "--name", "dis", "--cron", "0 9 * * *", "--", "true"])
         .assert()
         .success();
+
+    let id = first_job_id_with_prefix(&sb, "dis-");
+    sb.cmd().args(["disable", &id]).assert().success();
+
+    sb.cmd().args(["__run-job", &id]).assert().success();
 
     let out = sb
         .cmd()
@@ -378,7 +398,47 @@ fn history_skip_records_reason() {
         .stdout
         .clone();
     let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
-    assert_eq!(parsed[0]["skipped_reason"], "dnd");
+    assert_eq!(parsed[0]["skipped_reason"], "disabled");
+}
+
+#[test]
+fn run_with_force_bypasses_disabled() {
+    let sb = Sandbox::new();
+    sb.cmd()
+        .args(["add", "--name", "frc", "--cron", "0 9 * * *", "--", "true"])
+        .assert()
+        .success();
+
+    let id = first_job_id_with_prefix(&sb, "frc-");
+    sb.cmd().args(["disable", &id]).assert().success();
+
+    // Without --force, runner records a skip
+    sb.cmd().args(["run", &id]).assert().success();
+    let out = sb
+        .cmd()
+        .args(["history", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    assert_eq!(parsed[0]["skipped_reason"], "disabled");
+
+    // With --force, runner executes (records a real run)
+    sb.cmd().args(["run", &id, "--force"]).assert().success();
+    let out = sb
+        .cmd()
+        .args(["history", "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_str(&String::from_utf8(out).unwrap()).unwrap();
+    // Most recent entry first; should be a real run with exit 0
+    assert!(parsed[0]["skipped_reason"].is_null());
+    assert_eq!(parsed[0]["exit_code"], 0);
 }
 
 #[test]
