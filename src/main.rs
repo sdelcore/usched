@@ -10,7 +10,7 @@ mod systemd;
 mod time_input;
 
 use anyhow::Result;
-use chrono::{Timelike, Utc};
+use chrono::{Local, Timelike, Utc};
 use clap::{Parser, Subcommand};
 
 use job::{Constraints, Job, Schedule};
@@ -352,7 +352,10 @@ fn cmd_list(json: bool) -> Result<()> {
         for job in jobs {
             let schedule_str = match &job.schedule {
                 Schedule::Cron { expr, .. } => format!("cron: {}", expr),
-                Schedule::Once { at, .. } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
+                Schedule::Once { at, .. } => format!(
+                    "once: {}",
+                    at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+                ),
             };
 
             let status = if job.enabled { "enabled" } else { "disabled" };
@@ -642,7 +645,10 @@ fn cmd_export(output: Option<String>) -> Result<()> {
     for job in &jobs {
         let schedule_str = match &job.schedule {
             Schedule::Cron { expr, .. } => format!("`{}`", expr),
-            Schedule::Once { at, .. } => format!("once: {}", at.format("%Y-%m-%d %H:%M")),
+            Schedule::Once { at, .. } => format!(
+                "once: {}",
+                at.with_timezone(&Local).format("%Y-%m-%d %H:%M")
+            ),
         };
 
         let status = if job.enabled { "enabled" } else { "disabled" };
