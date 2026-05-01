@@ -38,9 +38,11 @@ CMD [ "--help" ]
 # ---------- e2e ----------
 FROM runtime AS e2e
 
+# usched no longer depends on at(1)/atd/atrm — one-shots are dispatched via
+# systemd user timers, same as recurring jobs.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        systemd systemd-sysv libpam-systemd dbus at procps \
+        systemd systemd-sysv libpam-systemd dbus procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Strip units that hang or fail in containers
@@ -62,7 +64,7 @@ RUN useradd -m -s /bin/bash testuser \
 COPY tests/e2e/run-tests.sh /usr/local/bin/run-tests.sh
 COPY tests/e2e/usched-e2e.service /etc/systemd/system/usched-e2e.service
 RUN chmod +x /usr/local/bin/run-tests.sh \
-    && systemctl enable usched-e2e.service atd.service
+    && systemctl enable usched-e2e.service
 
 VOLUME [ "/sys/fs/cgroup", "/run", "/run/lock", "/tmp" ]
 STOPSIGNAL SIGRTMIN+3

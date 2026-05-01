@@ -21,7 +21,7 @@
           '';
 
           meta = with pkgs.lib; {
-            description = "Unified scheduler CLI wrapping systemd-run and at";
+            description = "Unified scheduler CLI built on systemd user timers";
             license = licenses.mit;
             mainProgram = "usched";
           };

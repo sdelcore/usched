@@ -11,10 +11,9 @@ A user's instruction to run a command on a schedule, plus the constraints
 that gate it. Persisted in `jobs.json`. Identified by `<name>-<6-hex>`.
 
 **Schedule**
-How often a Job fires. Two variants: `Cron` (recurring, owned by systemd
-timers) and `Once` (one-shot, owned by `at`). Each variant carries the
-handle issued by its **Backend** — the systemd unit name or the `at` job
-number.
+How often a Job fires. Two variants: `Cron` (recurring) and `Once`
+(one-shot, absolute fire time). Both variants are dispatched through the
+same systemd backend; each carries the systemd unit name as its handle.
 
 **Constraints**
 The "should this run *right now*" predicates: `dnd_aware`, `not_during`,
@@ -23,10 +22,13 @@ Schedule decides *when* to wake up, Constraints decide whether to actually
 run once awake.
 
 **Backend**
-The OS scheduler that owns a Job's lifecycle: `Backend::Systemd` for
-recurring jobs, `Backend::At` for one-shots. An enum (closed set), with
-adapters in `systemd.rs` and `at.rs`. Every Schedule variant maps to
-exactly one Backend via `Schedule::backend()`.
+The OS scheduler that owns a Job's lifecycle. Currently one variant —
+`Backend::Systemd` — which writes persistent `.timer`/`.service` user
+units for both recurring and one-shot jobs. The single-variant enum is
+kept so a future second backend would be a compiler-enforced sweep, not
+silent dispatch. The pre-systemd-only versions of usched also had
+`Backend::At` (shelling out to `at(1)`/`atrm`); migration helpers live
+in `migrate.rs`.
 
 **Runner**
 The execution path between "the timer fired" and "the command ran." Two
@@ -37,8 +39,8 @@ parts:
   finish in the history database.
 
 The Runner is invoked through the hidden `usched __run-job <id>`
-subcommand. Both the systemd `.service` `ExecStart` and the `at` queue
-entry call into it.
+subcommand. The systemd `.service` `ExecStart` calls into it for both
+recurring and one-shot jobs.
 
 **State**
 Out-of-band runtime state that affects Constraints — currently just the

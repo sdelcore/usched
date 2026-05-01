@@ -103,6 +103,53 @@ else
     ng "could not extract job id from list"
 fi
 
+section "smoke: schedule one-shot job (systemd-only, no at(1))"
+# Schedule for ~30s in the future and wait up to 90s for the marker.
+once_at=$(date -u -d '+30 seconds' +'%Y-%m-%dT%H:%M:%SZ')
+once_local=$(date -d "$once_at" +'%Y-%m-%d %H:%M:%S')
+log "scheduling one-shot for $once_local (local)"
+rm -f /home/testuser/once-marker
+if as_user usched add --name e2e-once --once "$once_local" -- /bin/sh -c 'echo once-fired > /home/testuser/once-marker'; then
+    ok "usched add --once"
+else
+    ng "usched add --once"
+fi
+
+if as_user systemctl --user list-timers --all | grep -q usched-e2e-once; then
+    ok "one-shot timer registered with systemd"
+else
+    ng "one-shot timer not visible"
+    as_user systemctl --user list-timers --all || true
+fi
+
+# Verify usched did not invoke at(1): the at binary isn't installed in this
+# image, so any code path that shelled out would have failed loudly. The
+# unit file is the canonical signal.
+once_unit=$(as_user systemctl --user list-unit-files | awk '/usched-e2e-once-.*\.timer/ {print $1; exit}')
+if [ -n "$once_unit" ]; then
+    ok "one-shot dispatched via systemd unit ($once_unit)"
+else
+    ng "no systemd unit for one-shot"
+fi
+
+once_fired=0
+for i in $(seq 1 90); do
+    if [ -f /home/testuser/once-marker ]; then
+        log "once marker after ${i}s"
+        once_fired=1
+        break
+    fi
+    sleep 1
+done
+if [ "$once_fired" = 1 ]; then
+    ok "one-shot timer fired and command ran"
+else
+    ng "one-shot marker never appeared (timer did not fire within 90s)"
+    as_user systemctl --user status 'usched-e2e-once-*.timer' || true
+    as_user systemctl --user status 'usched-e2e-once-*.service' || true
+    as_user journalctl --user --no-pager -n 50 || true
+fi
+
 section "summary"
 log "PASS=$PASS FAIL=$FAIL"
 if [ "$FAIL" -gt 0 ]; then

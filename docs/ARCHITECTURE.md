@@ -4,9 +4,10 @@ Technical architecture documentation for the unified scheduler.
 
 ## Overview
 
-usched provides a unified interface for scheduling jobs across two backends:
-- **systemd timers** for recurring jobs
-- **at command** for one-time jobs
+usched provides a unified interface for scheduling jobs on top of **systemd
+user timers**. Both recurring (`--cron`) and one-shot (`--once`) jobs are
+backed by persistent `.timer` + `.service` unit pairs. There is no runtime
+dependency on `at(1)`/`atd`/`atrm`.
 
 ## Component Diagram
 
@@ -28,15 +29,13 @@ usched provides a unified interface for scheduling jobs across two backends:
 │  │              ~/.local/share/usched/jobs.json                 │   │
 │  └──────────────────────────┬──────────────────────────────────┘   │
 │                             │                                       │
-│              ┌──────────────┴──────────────┐                       │
-│              ▼                             ▼                       │
-│  ┌─────────────────────┐       ┌─────────────────────┐            │
-│  │   systemd Backend   │       │     at Backend      │            │
-│  │   (recurring jobs)  │       │   (one-time jobs)   │            │
-│  │                     │       │                     │            │
-│  │  - .timer units     │       │  - at command       │            │
-│  │  - .service units   │       │  - atq/atrm         │            │
-│  └─────────────────────┘       └─────────────────────┘            │
+│                             ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────┐   │
+│  │                     systemd Backend                          │   │
+│  │  recurring:  OnCalendar=<converted cron>  Persistent=true    │   │
+│  │  one-shot:   OnCalendar=<absolute time>   Persistent=true    │   │
+│  │  units:      ~/.config/systemd/user/usched-<id>.{timer,service}
+│  └─────────────────────────────────────────────────────────────┘   │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -145,19 +144,33 @@ Type=oneshot
 ExecStart=/path/to/usched-run <job-id>
 ```
 
-## at Integration
+## One-shot Jobs
 
-One-time jobs use the system `at` command:
+`--once` jobs are dispatched via systemd user timers, the same machinery
+that backs cron jobs. The only difference is the `OnCalendar` field — a
+single absolute timestamp like `2099-06-15 09:00:00` instead of a
+recurring calendar spec.
 
-```bash
-# Schedule
-echo "usched-run <job-id>" | at <datetime>
+```ini
+[Timer]
+OnCalendar=2099-06-15 09:00:00
+Persistent=true
+Unit=usched-<id>.service
 
-# List
-atq
-
-# Remove
-atrm <at-job-id>
+[Install]
+WantedBy=timers.target
 ```
 
-The at job ID is stored in the job metadata for later removal.
+`Persistent=true` means systemd fires the timer on resume if the host was
+suspended past the fire time (the right behavior for reminders). Once the
+timer has elapsed, the unit goes inactive and won't re-fire. `usched
+sync` skips already-fired one-shots; `usched remove` cleans them up
+explicitly.
+
+### Migration from at(1)
+
+Pre-systemd-only versions of usched stored an at-queue job number in
+`Schedule::Once::at_job`. `usched migrate-from-at` walks `jobs.json`,
+re-registers each pending one-shot as a systemd timer, best-effort-removes
+the old at-queue entry (warns rather than fails when `atd` is unreachable),
+and drops past-due entries. Idempotent — safe to run repeatedly.
