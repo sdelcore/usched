@@ -500,3 +500,98 @@ fn remove_unknown_job_errors() {
         .failure()
         .stderr(predicate::str::contains("not found"));
 }
+
+/// Regression: on hosts without `atd` running, `atrm` itself fails with
+/// `Cannot get uid for atd: Success` (libc strerror(0) when getpwnam
+/// returns NULL). Removing a one-shot job should still succeed: usched's
+/// metadata is the source of truth, and the at-queue entry is harmless
+/// without atd to fire it. See sdelcore/usched#4.
+#[test]
+fn remove_once_job_when_atd_unavailable() {
+    let sb = Sandbox::new();
+
+    sb.cmd()
+        .args([
+            "add",
+            "--name",
+            "ghost",
+            "--once",
+            "2099-06-15 09:00",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .assert()
+        .success();
+
+    let id = first_job_id_with_prefix(&sb, "ghost-");
+
+    // Make atrm reproduce the at(1) error you see on NixOS without
+    // services.atd: getpwnam("atd") returns NULL → libc calls
+    // strerror(0) which is "Success".
+    sb.override_stub(
+        "atrm",
+        "printf 'Cannot get uid for atd: Success\\n' 1>&2\nexit 1\n",
+    );
+
+    sb.cmd()
+        .args(["remove", &id])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed"))
+        .stderr(predicate::str::contains("warning"))
+        .stderr(predicate::str::contains("atd"));
+
+    // Job is gone from usched's metadata — the source of truth.
+    let listing = String::from_utf8(
+        sb.cmd()
+            .args(["list"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        !listing.contains(&id),
+        "job {} should be removed from jobs.json, list was:\n{}",
+        id,
+        listing
+    );
+}
+
+/// If atrm fails for any other reason, `usched remove` should still
+/// surface that error rather than silently swallow it — we only special-
+/// case the "atd unreachable" signature.
+#[test]
+fn remove_once_job_propagates_unknown_atrm_error() {
+    let sb = Sandbox::new();
+
+    sb.cmd()
+        .args([
+            "add",
+            "--name",
+            "kept",
+            "--once",
+            "2099-06-15 09:00",
+            "--",
+            "echo",
+            "hi",
+        ])
+        .assert()
+        .success();
+
+    let id = first_job_id_with_prefix(&sb, "kept-");
+
+    sb.override_stub(
+        "atrm",
+        "printf 'atrm: catastrophic failure\\n' 1>&2\nexit 1\n",
+    );
+
+    sb.cmd()
+        .args(["remove", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("atrm failed"));
+}

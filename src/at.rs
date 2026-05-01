@@ -46,6 +46,14 @@ pub fn schedule_at(
 }
 
 /// Remove an at job.
+///
+/// On hosts where `atd` isn't running (e.g. NixOS without
+/// `services.atd`), `atrm` itself fails with `Cannot get uid for atd`
+/// because libc's `getpwnam("atd")` returns NULL. The job in the at
+/// queue (if any) is harmless without atd to fire it, so we treat that
+/// case as a warning rather than a hard error — usched's own metadata
+/// is the source of truth and the caller still wants the job gone.
+/// Any other atrm failure is propagated.
 pub fn remove_at(job_num: &str) -> Result<()> {
     let output = Command::new("atrm")
         .arg(job_num)
@@ -54,9 +62,21 @@ pub fn remove_at(job_num: &str) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("cannot find") {
-            anyhow::bail!("atrm failed: {}", stderr);
+        if stderr.contains("cannot find") {
+            // atrm couldn't find that job number — already gone.
+            return Ok(());
         }
+        if stderr.contains("Cannot get uid for atd") {
+            eprintln!(
+                "warning: atrm could not reach atd ({}). \
+                 The at-queue entry (if any) was left untouched, but the \
+                 job has been removed from usched. Enable services.atd if \
+                 you want at-queue cleanup to succeed.",
+                stderr.trim()
+            );
+            return Ok(());
+        }
+        anyhow::bail!("atrm failed: {}", stderr);
     }
 
     Ok(())
