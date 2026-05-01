@@ -30,14 +30,18 @@ cargo clippy
 usched/
 ├── src/
 │   ├── main.rs          # CLI entry point (clap)
+│   ├── backend.rs       # Backend dispatch (single-variant: Systemd)
 │   ├── job.rs           # Job, Schedule, Constraints structs
 │   ├── store.rs         # JSON persistence
-│   ├── systemd.rs       # systemd timer/service creation
-│   ├── at.rs            # at command integration
+│   ├── systemd.rs       # systemd timer/service creation (recurring + one-shot)
+│   ├── migrate.rs       # at(1) → systemd one-shot migration
+│   ├── runner.rs        # Constraint evaluation + execution path
+│   ├── time_input.rs    # User-supplied time/duration parsers
 │   ├── cron_convert.rs  # Cron to OnCalendar conversion
+│   ├── history.rs       # SQLite execution history
 │   └── dnd.rs           # Do Not Disturb logic
 ├── scripts/
-│   └── usched-run       # Constraint enforcement wrapper
+│   └── usched-run       # Compat shim → `usched __run-job`
 ├── docs/
 │   ├── ARCHITECTURE.md
 │   └── DEVELOPMENT.md
@@ -52,13 +56,16 @@ usched/
 | File | Purpose |
 |------|---------|
 | `src/main.rs` | CLI parsing with clap |
+| `src/backend.rs` | Backend dispatch — currently single-variant (`Systemd`) |
 | `src/job.rs` | Job/Schedule/Constraints data structures |
 | `src/store.rs` | Load/save jobs.json and state.json |
-| `src/systemd.rs` | Generate and manage systemd units |
-| `src/at.rs` | Interface with at/atq/atrm commands |
+| `src/systemd.rs` | Generate and manage systemd units (cron + one-shot) |
+| `src/migrate.rs` | One-shot `usched migrate-from-at` implementation |
+| `src/runner.rs` | Constraint evaluation + impure execution |
+| `src/time_input.rs` | Natural-language datetime / duration / range parsers |
 | `src/cron_convert.rs` | Convert cron expressions to OnCalendar |
 | `src/dnd.rs` | DND state management and duration parsing |
-| `scripts/usched-run` | Shell script for constraint checking |
+| `scripts/usched-run` | Backwards-compat shim that forwards to `usched __run-job` |
 
 ## Adding a New Constraint
 
@@ -146,16 +153,6 @@ systemctl --user status usched-<job-id>.service
 # View unit files
 cat ~/.config/systemd/user/usched-*.timer
 cat ~/.config/systemd/user/usched-*.service
-```
-
-### Check at Jobs
-
-```bash
-# List at jobs
-atq
-
-# View job content
-at -c <job-number>
 ```
 
 ## Common Tasks

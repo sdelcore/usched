@@ -13,14 +13,23 @@ pub struct Job {
     pub created_by: String,
 }
 
-/// How and when a Job fires. The handle issued by the owning [`Backend`]
-/// (the systemd unit name or the `at` job number) lives inside the variant
-/// so it cannot drift out of sync with the schedule kind.
+/// How and when a Job fires. The handle is the systemd user unit name
+/// (`usched-<id>`) regardless of variant — both recurring and one-shot
+/// jobs are backed by `.timer` + `.service` units.
+///
+/// `at_job` exists on `Once` for backward-compatible reads of jobs.json
+/// produced by pre-systemd-only versions of usched (when one-shots were
+/// dispatched via `at(1)`). It's never written by current code; legacy
+/// values are migrated into `unit` by `usched migrate-from-at`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Schedule {
     Once {
         at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        unit: Option<String>,
+        /// Legacy: at-queue job number from pre-systemd-only versions.
+        /// Kept for read-back; never written by current code.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         at_job: Option<String>,
     },
@@ -68,6 +77,8 @@ impl<'de> Deserialize<'de> for Job {
             Once {
                 at: DateTime<Utc>,
                 #[serde(default)]
+                unit: Option<String>,
+                #[serde(default)]
                 at_job: Option<String>,
             },
             Cron {
@@ -79,8 +90,9 @@ impl<'de> Deserialize<'de> for Job {
 
         let r = Raw::deserialize(d)?;
         let schedule = match r.schedule {
-            RawSchedule::Once { at, at_job } => Schedule::Once {
+            RawSchedule::Once { at, unit, at_job } => Schedule::Once {
                 at,
+                unit,
                 at_job: at_job.or(r.at_job),
             },
             RawSchedule::Cron { expr, unit } => Schedule::Cron {
@@ -251,8 +263,31 @@ mod tests {
         }"#;
         let job: Job = serde_json::from_str(json).unwrap();
         match job.schedule {
-            Schedule::Once { at_job, .. } => {
+            Schedule::Once { at_job, unit, .. } => {
                 assert_eq!(at_job.as_deref(), Some("42"));
+                assert_eq!(unit, None);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn job_deserializes_once_with_systemd_unit() {
+        let json = r#"{
+            "id": "o-2",
+            "name": "o",
+            "schedule": {"type": "once", "at": "2099-01-01T00:00:00Z", "unit": "usched-o-2"},
+            "command": ["true"],
+            "constraints": {},
+            "enabled": true,
+            "created_at": "2026-01-01T00:00:00Z",
+            "created_by": "user"
+        }"#;
+        let job: Job = serde_json::from_str(json).unwrap();
+        match job.schedule {
+            Schedule::Once { unit, at_job, .. } => {
+                assert_eq!(unit.as_deref(), Some("usched-o-2"));
+                assert_eq!(at_job, None);
             }
             _ => panic!("wrong variant"),
         }

@@ -1,10 +1,12 @@
 # usched - Unified Scheduler
 
-A Rust CLI tool that provides a unified interface for scheduling jobs across multiple backends: **systemd timers** for recurring jobs and **at** for one-time jobs.
+A Rust CLI tool that provides a unified interface for scheduling jobs on top of **systemd user timers** — both recurring and one-shot.
 
 ## Features
 
-- **Dual Backends** - systemd timers (recurring) + at command (one-time)
+- **systemd-only backend** - both cron-style recurring jobs and `--once`
+  one-shots are dispatched via persistent `.timer`/`.service` units. No
+  runtime dependency on `at(1)`/`atd`/`atrm`.
 - **Cron Expressions** - Full cron syntax for recurring schedules
 - **Natural Datetime** - "tomorrow 14:00", "in 2 hours", "2024-01-20 15:00"
 - **Do Not Disturb** - Skip jobs during DND periods
@@ -101,10 +103,11 @@ For `--once` scheduling:
 
 | Format | Example |
 |--------|---------|
-| Relative | `in 2 hours`, `in 30 minutes` |
+| Relative | `in 2 hours`, `in 30 minutes`, `in 3 days` |
+| Today | `today 23:30` |
 | Tomorrow | `tomorrow 14:00` |
-| Absolute | `2024-01-20 15:00` |
-| Time only | `14:00` (today or tomorrow) |
+| Absolute | `2024-01-20 15:00`, `2024-01-20 15:00:30` |
+| Time only | `14:00` / `14:00:30` (today if still future, otherwise tomorrow) |
 
 ## Time Constraints
 
@@ -132,10 +135,11 @@ usched add --cron "0 * * * *" --dnd-aware -- notify-send "Hourly check"
 
 ### Constraint Enforcement
 
-Jobs are wrapped with `usched-run` which validates constraints before execution:
+Jobs are wrapped via `usched __run-job <id>` which validates constraints
+before execution:
 
 ```
-at/systemd triggers → usched-run <job-id> <command>
+systemd timer fires → usched __run-job <job-id>
                            │
                            ▼
                     Check enabled?
@@ -153,6 +157,20 @@ at/systemd triggers → usched-run <job-id> <command>
                     Handle auto-removal
 ```
 
+### Migrating from at(1)
+
+Hosts that previously ran usched against `atd` can migrate any pending
+one-shots onto systemd timers idempotently:
+
+```bash
+usched migrate-from-at
+```
+
+This re-registers each `--once` job as a systemd user timer (using the same
+absolute fire time), best-effort-removes the legacy at-queue entry (warns
+rather than fails if `atd` is unreachable), and drops past-due entries that
+can no longer be scheduled. Safe to run repeatedly.
+
 ### Storage
 
 - Jobs: `~/.local/share/usched/jobs.json`
@@ -168,6 +186,9 @@ nix build
 cargo build --release
 ```
 
-The build installs both:
+The build installs:
 - `usched` - Main CLI binary
-- `usched-run` - Wrapper script for constraint enforcement
+- `usched-run` - Compatibility shim that forwards to `usched __run-job <id>`
+  for unit files written by older versions. New installs don't need it; the
+  shim exists so legacy `.service` units keep working until `usched sync`
+  rewrites them.

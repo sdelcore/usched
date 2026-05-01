@@ -1,9 +1,9 @@
-mod at;
 mod backend;
 mod cron_convert;
 mod dnd;
 pub mod history;
 mod job;
+mod migrate;
 mod runner;
 pub mod store;
 mod systemd;
@@ -18,7 +18,7 @@ use store::JobStore;
 
 #[derive(Parser)]
 #[command(name = "usched")]
-#[command(about = "Unified scheduler CLI wrapping systemd-run and at")]
+#[command(about = "Unified scheduler CLI built on systemd user timers")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -187,6 +187,10 @@ enum Commands {
         #[command(subcommand)]
         action: DndAction,
     },
+
+    /// Migrate one-shot jobs scheduled with the legacy `at(1)` backend
+    /// onto systemd user timers. Idempotent — safe to run multiple times.
+    MigrateFromAt,
 }
 
 #[derive(Subcommand)]
@@ -236,7 +240,17 @@ fn main() -> Result<()> {
             DndAction::Off => dnd::clear_dnd(),
             DndAction::Status => dnd::show_dnd_status(),
         },
+        Commands::MigrateFromAt => cmd_migrate_from_at(),
     }
+}
+
+fn cmd_migrate_from_at() -> Result<()> {
+    let (migrated, dropped, kept) = migrate::run()?;
+    println!(
+        "Migration complete: {} migrated to systemd, {} dropped (past due), {} unchanged",
+        migrated, dropped, kept
+    );
+    Ok(())
 }
 
 fn cmd_add(
@@ -273,7 +287,7 @@ fn cmd_add(
         Schedule::Cron { expr: cron_expr.clone(), unit: None }
     } else {
         let at_time = time_input::parse_datetime(once.as_ref().unwrap())?;
-        Schedule::Once { at: at_time, at_job: None }
+        Schedule::Once { at: at_time, unit: None, at_job: None }
     };
 
     let constraints = Constraints {
@@ -304,8 +318,14 @@ fn cmd_add(
         Schedule::Cron { .. } => {
             println!("Created recurring job '{}' with systemd timer '{}'", job_id, handle);
         }
-        Schedule::Once { .. } => {
-            println!("Created one-off job '{}' with at job #{}", job_id, handle);
+        Schedule::Once { at, .. } => {
+            let local: chrono::DateTime<chrono::Local> = (*at).into();
+            println!(
+                "Created one-off job '{}' with systemd timer '{}' (fires {})",
+                job_id,
+                handle,
+                local.format("%Y-%m-%d %H:%M:%S")
+            );
         }
     }
     job.schedule.set_handle(handle);
@@ -375,10 +395,7 @@ fn cmd_remove(id: &str) -> Result<()> {
 
     if let Some(handle) = job.schedule.handle() {
         job.schedule.backend().remove(handle)?;
-        match &job.schedule {
-            Schedule::Cron { .. } => println!("Removed systemd timer '{}'", handle),
-            Schedule::Once { .. } => println!("Removed at job #{}", handle),
-        }
+        println!("Removed systemd timer '{}'", handle);
     }
 
     store.save()?;
@@ -450,19 +467,11 @@ fn cmd_run_job(job_id: &str) -> Result<()> {
 fn cmd_next() -> Result<()> {
     println!("=== Systemd Timers ===");
     let timers = systemd::list_timers()?;
-    // Filter to only show sched timers
+    // Filter to only show usched timers
     for line in timers.lines() {
         if line.contains("usched-") || line.starts_with("NEXT") || line.starts_with("---") {
             println!("{}", line);
         }
-    }
-
-    println!("\n=== At Jobs ===");
-    let at_jobs = at::list_at_jobs()?;
-    if at_jobs.is_empty() {
-        println!("No pending at jobs");
-    } else {
-        print!("{}", at_jobs);
     }
 
     Ok(())
@@ -756,41 +765,48 @@ fn cmd_sync() -> Result<()> {
     let mut skipped = 0;
     let mut orphans_cleaned = 0;
 
-    // Phase 1: Ensure all jobs have working timers
+    // Phase 1: Ensure all jobs have working timers.
+    // One-shot jobs whose fire time has already elapsed are skipped — there
+    // is nothing to recreate; the timer has done its job.
     for job in &jobs {
-        if let Schedule::Cron { .. } = &job.schedule {
-            let unit_name = job.schedule.handle().unwrap_or("");
+        let already_fired = matches!(
+            &job.schedule,
+            Schedule::Once { at, .. } if *at <= chrono::Utc::now()
+        );
+        if already_fired {
+            skipped += 1;
+            continue;
+        }
 
-            let needs_rewrite = if unit_name.is_empty() {
-                Some("no unit recorded")
-            } else if !systemd::verify_timer(unit_name) {
-                Some("missing timer")
-            } else if systemd::timer_is_legacy(unit_name) {
-                Some("legacy ExecStart format")
-            } else {
-                None
-            };
+        let unit_name = job.schedule.handle().unwrap_or("");
 
-            match needs_rewrite {
-                None => ok += 1,
-                Some(reason) => {
-                    println!("Rewriting timer for '{}' ({})...", job.id, reason);
-                    match systemd::recreate_timer(job) {
-                        Ok(new_unit) => {
-                            if let Some(j) = store.get_mut(&job.id) {
-                                j.schedule.set_handle(new_unit.clone());
-                            }
-                            println!("  Wrote: {}", new_unit);
-                            fixed += 1;
+        let needs_rewrite = if unit_name.is_empty() {
+            Some("no unit recorded")
+        } else if !systemd::verify_timer(unit_name) {
+            Some("missing timer")
+        } else if systemd::timer_is_legacy(unit_name) {
+            Some("legacy ExecStart format")
+        } else {
+            None
+        };
+
+        match needs_rewrite {
+            None => ok += 1,
+            Some(reason) => {
+                println!("Rewriting timer for '{}' ({})...", job.id, reason);
+                match systemd::recreate_timer(job) {
+                    Ok(new_unit) => {
+                        if let Some(j) = store.get_mut(&job.id) {
+                            j.schedule.set_handle(new_unit.clone());
                         }
-                        Err(e) => {
-                            eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
-                        }
+                        println!("  Wrote: {}", new_unit);
+                        fixed += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("  Failed to recreate timer for '{}': {}", job.id, e);
                     }
                 }
             }
-        } else {
-            skipped += 1;
         }
     }
 
@@ -814,7 +830,7 @@ fn cmd_sync() -> Result<()> {
 
     println!();
     println!(
-        "Sync complete: {} ok, {} fixed, {} orphans cleaned, {} skipped (one-off)",
+        "Sync complete: {} ok, {} fixed, {} orphans cleaned, {} skipped (already-fired one-offs)",
         ok, fixed, orphans_cleaned, skipped
     );
 
@@ -848,8 +864,14 @@ fn cmd_check() -> Result<()> {
             }
         }
 
-        // Check timer health via the owning backend
-        if let Schedule::Cron { .. } = &job.schedule {
+        // Check timer health via the owning backend.
+        // For one-shot jobs whose fire time has elapsed, the timer is
+        // expected to be "inactive" — that's a successful run, not an error.
+        let already_fired = matches!(
+            &job.schedule,
+            Schedule::Once { at, .. } if *at <= chrono::Utc::now()
+        );
+        if !already_fired {
             match job.schedule.handle() {
                 Some(handle) => {
                     if !job.schedule.backend().verify(handle) {

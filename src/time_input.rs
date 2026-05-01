@@ -17,36 +17,48 @@ use crate::job::TimeRange;
 
 /// Parse a natural datetime string into UTC.
 ///
-/// Supports:
-/// - `"in 2 hours"`, `"in 30 minutes"`, `"in 5 min"`, `"in 1 hour"`
-/// - `"tomorrow HH:MM"`
-/// - `"YYYY-MM-DD HH:MM"`
-/// - `"HH:MM"` (today if still future, otherwise tomorrow)
+/// Supported forms:
+/// - `"YYYY-MM-DD HH:MM"` / `"YYYY-MM-DD HH:MM:SS"` — absolute
+/// - `"today HH:MM"` / `"today HH:MM:SS"` — today at that time
+/// - `"tomorrow HH:MM"` / `"tomorrow HH:MM:SS"` — tomorrow at that time
+/// - `"in N minutes"` / `"in N hours"` / `"in N days"` (singular or plural)
+/// - `"HH:MM"` / `"HH:MM:SS"` — today if still future, otherwise tomorrow
+///
+/// Anything else returns a clear error listing the supported forms.
 pub fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
     let s = s.trim().to_lowercase();
     let now = Local::now();
 
-    if s.starts_with("in ") {
-        let rest = &s[3..];
-        if let Some(hours) = rest.strip_suffix(" hours").or_else(|| rest.strip_suffix(" hour")) {
-            let h: i64 = hours.trim().parse()?;
-            return Ok((now + Duration::hours(h)).with_timezone(&Utc));
-        }
-        if let Some(mins) = rest
-            .strip_suffix(" minutes")
-            .or_else(|| rest.strip_suffix(" minute").or_else(|| rest.strip_suffix(" min")))
-        {
-            let m: i64 = mins.trim().parse()?;
-            return Ok((now + Duration::minutes(m)).with_timezone(&Utc));
+    if let Some(rest) = s.strip_prefix("in ") {
+        if let Some(dt) = parse_in_relative(rest, now)? {
+            return Ok(dt);
         }
     }
 
-    if s.starts_with("tomorrow") {
-        let time_part = s.strip_prefix("tomorrow").unwrap().trim();
-        let time = NaiveTime::parse_from_str(time_part, "%H:%M")
-            .or_else(|_| NaiveTime::parse_from_str(time_part, "%H:%M:%S"))?;
+    if let Some(rest) = s.strip_prefix("today") {
+        let time_part = rest.trim();
+        let time = parse_hms(time_part)?;
+        let dt = now.date_naive().and_time(time);
+        let local_dt = Local
+            .from_local_datetime(&dt)
+            .single()
+            .context("Invalid local datetime")?;
+        return Ok(local_dt.with_timezone(&Utc));
+    }
+
+    if let Some(rest) = s.strip_prefix("tomorrow") {
+        let time_part = rest.trim();
+        let time = parse_hms(time_part)?;
         let tomorrow = now.date_naive() + Duration::days(1);
         let dt = tomorrow.and_time(time);
+        let local_dt = Local
+            .from_local_datetime(&dt)
+            .single()
+            .context("Invalid local datetime")?;
+        return Ok(local_dt.with_timezone(&Utc));
+    }
+
+    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S") {
         let local_dt = Local
             .from_local_datetime(&dt)
             .single()
@@ -62,7 +74,7 @@ pub fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
         return Ok(local_dt.with_timezone(&Utc));
     }
 
-    if let Ok(time) = NaiveTime::parse_from_str(&s, "%H:%M") {
+    if let Ok(time) = parse_hms(&s) {
         let dt = now.date_naive().and_time(time);
         let mut local_dt = Local
             .from_local_datetime(&dt)
@@ -79,7 +91,47 @@ pub fn parse_datetime(s: &str) -> Result<DateTime<Utc>> {
         return Ok(local_dt.with_timezone(&Utc));
     }
 
-    anyhow::bail!("Could not parse datetime: {}", s)
+    anyhow::bail!(
+        "Could not parse datetime: {:?}. Supported forms: \
+         'YYYY-MM-DD HH:MM[:SS]', 'today HH:MM[:SS]', 'tomorrow HH:MM[:SS]', \
+         'in N (minutes|hours|days)', 'HH:MM[:SS]'.",
+        s
+    )
+}
+
+/// Parse "N minutes" / "N hours" / "N days" (singular or plural). Returns
+/// `Ok(None)` if the suffix doesn't match — the caller may try other forms.
+fn parse_in_relative(rest: &str, now: chrono::DateTime<Local>) -> Result<Option<DateTime<Utc>>> {
+    let rest = rest.trim();
+    if let Some(num) = rest
+        .strip_suffix(" days")
+        .or_else(|| rest.strip_suffix(" day"))
+    {
+        let d: i64 = num.trim().parse()?;
+        return Ok(Some((now + Duration::days(d)).with_timezone(&Utc)));
+    }
+    if let Some(num) = rest
+        .strip_suffix(" hours")
+        .or_else(|| rest.strip_suffix(" hour"))
+    {
+        let h: i64 = num.trim().parse()?;
+        return Ok(Some((now + Duration::hours(h)).with_timezone(&Utc)));
+    }
+    if let Some(num) = rest
+        .strip_suffix(" minutes")
+        .or_else(|| rest.strip_suffix(" minute").or_else(|| rest.strip_suffix(" min")))
+    {
+        let m: i64 = num.trim().parse()?;
+        return Ok(Some((now + Duration::minutes(m)).with_timezone(&Utc)));
+    }
+    Ok(None)
+}
+
+/// Accept `HH:MM` or `HH:MM:SS`.
+fn parse_hms(s: &str) -> Result<NaiveTime> {
+    NaiveTime::parse_from_str(s, "%H:%M:%S")
+        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M"))
+        .with_context(|| format!("Invalid time {:?}, expected HH:MM or HH:MM:SS", s))
 }
 
 /// Parse a duration string like `"2h"`, `"30m"`, `"1h30m"`. Bare numbers
@@ -188,11 +240,80 @@ mod tests {
     }
 
     #[test]
+    fn datetime_in_days() {
+        let now = Local::now();
+        let parsed = parse_datetime("in 3 days").unwrap();
+        let delta = parsed - now.with_timezone(&Utc);
+        let expected = 3 * 24 * 3600;
+        assert!(
+            delta.num_seconds() >= expected - 5 && delta.num_seconds() <= expected + 5,
+            "delta was {}",
+            delta.num_seconds()
+        );
+    }
+
+    #[test]
+    fn datetime_in_one_day_singular() {
+        assert!(parse_datetime("in 1 day").is_ok());
+    }
+
+    #[test]
+    fn datetime_today() {
+        let parsed = parse_datetime("today 23:59").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(local.date_naive(), Local::now().date_naive());
+        assert_eq!(local.format("%H:%M").to_string(), "23:59");
+    }
+
+    #[test]
+    fn datetime_today_with_seconds() {
+        let parsed = parse_datetime("today 23:59:30").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(local.format("%H:%M:%S").to_string(), "23:59:30");
+    }
+
+    #[test]
+    fn datetime_tomorrow_with_seconds() {
+        let parsed = parse_datetime("tomorrow 14:00:30").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(local.format("%H:%M:%S").to_string(), "14:00:30");
+    }
+
+    #[test]
+    fn datetime_absolute_with_seconds() {
+        let parsed = parse_datetime("2099-06-15 09:30:45").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(
+            local.format("%Y-%m-%d %H:%M:%S").to_string(),
+            "2099-06-15 09:30:45"
+        );
+    }
+
+    #[test]
+    fn datetime_hhmmss_bare() {
+        // 23:59:30 should parse the same as 23:59 logic — today if future,
+        // else tomorrow. Either way, it should round-trip the seconds.
+        let parsed = parse_datetime("23:59:30").unwrap();
+        let local = parsed.with_timezone(&Local);
+        assert_eq!(local.format("%H:%M:%S").to_string(), "23:59:30");
+    }
+
+    #[test]
     fn datetime_invalid() {
         assert!(parse_datetime("garbage").is_err());
         assert!(parse_datetime("").is_err());
         assert!(parse_datetime("in two hours").is_err());
         assert!(parse_datetime("tomorrow notatime").is_err());
+        assert!(parse_datetime("today notatime").is_err());
+        assert!(parse_datetime("in 5 fortnights").is_err());
+    }
+
+    #[test]
+    fn datetime_error_lists_supported_forms() {
+        let err = parse_datetime("nonsense").unwrap_err().to_string();
+        assert!(err.contains("YYYY-MM-DD"), "err was: {}", err);
+        assert!(err.contains("tomorrow"), "err was: {}", err);
+        assert!(err.contains("in N"), "err was: {}", err);
     }
 
     // -- parse_duration --

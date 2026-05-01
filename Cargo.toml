@@ -2,11 +2,11 @@
 name = "usched"
 version = "0.1.0"
 edition = "2021"
-description = "Unified scheduler CLI wrapping systemd-run and at"
+description = "Unified scheduler CLI built on systemd user timers"
 license = "MIT"
 repository = "https://github.com/sdelcore/usched"
 authors = ["sdelcore"]
-keywords = ["scheduler", "cron", "systemd", "at"]
+keywords = ["scheduler", "cron", "systemd", "timer"]
 categories = ["command-line-utilities"]
 
 [dependencies]

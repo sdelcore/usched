@@ -132,7 +132,7 @@ fn add_then_list_then_remove_roundtrip() {
 }
 
 #[test]
-fn add_once_invokes_at() {
+fn add_once_writes_systemd_timer() {
     let sb = Sandbox::new();
     sb.cmd()
         .args([
@@ -147,10 +147,75 @@ fn add_once_invokes_at() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("at job #42"));
+        .stdout(predicate::str::contains("systemd timer"))
+        .stdout(predicate::str::contains("2099-06-15 09:00:00"));
 
-    let calls = sb.invocations_for("at");
-    assert!(!calls.is_empty(), "at was not called");
+    // .timer and .service unit files written
+    let unit_dir = sb.systemd_user_dir();
+    let entries: Vec<_> = std::fs::read_dir(&unit_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries
+            .iter()
+            .any(|n| n.starts_with("usched-once-job-") && n.ends_with(".timer")),
+        "expected a .timer file, got {:?}",
+        entries
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|n| n.starts_with("usched-once-job-") && n.ends_with(".service")),
+        "expected a .service file, got {:?}",
+        entries
+    );
+
+    // The timer file should use OnCalendar=<absolute timestamp> with Persistent=true
+    let timer_path = entries
+        .iter()
+        .find(|n| n.starts_with("usched-once-job-") && n.ends_with(".timer"))
+        .unwrap();
+    let timer_body = std::fs::read_to_string(unit_dir.join(timer_path)).unwrap();
+    assert!(
+        timer_body.contains("OnCalendar=2099-06-15 09:00:00"),
+        "timer body: {}",
+        timer_body
+    );
+    assert!(
+        timer_body.contains("Persistent=true"),
+        "timer body: {}",
+        timer_body
+    );
+
+    // systemctl was invoked: daemon-reload then enable --now
+    let calls = sb.invocations_for("systemctl");
+    assert!(
+        calls.iter().any(|c| c.contains("daemon-reload")),
+        "expected daemon-reload, got {:?}",
+        calls
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|c| c.contains("enable") && c.contains("--now")),
+        "expected enable --now, got {:?}",
+        calls
+    );
+
+    // No at-suite invocations — usched no longer depends on at(1)/atd/atrm.
+    assert!(
+        sb.invocations_for("at").is_empty(),
+        "at(1) should not be invoked"
+    );
+    assert!(
+        sb.invocations_for("atrm").is_empty(),
+        "atrm should not be invoked"
+    );
+    assert!(
+        sb.invocations_for("atq").is_empty(),
+        "atq should not be invoked"
+    );
 }
 
 #[test]
@@ -501,13 +566,10 @@ fn remove_unknown_job_errors() {
         .stderr(predicate::str::contains("not found"));
 }
 
-/// Regression: on hosts without `atd` running, `atrm` itself fails with
-/// `Cannot get uid for atd: Success` (libc strerror(0) when getpwnam
-/// returns NULL). Removing a one-shot job should still succeed: usched's
-/// metadata is the source of truth, and the at-queue entry is harmless
-/// without atd to fire it. See sdelcore/usched#4.
+/// Removing a one-shot job tears down its systemd timer the same way a
+/// recurring job's removal does — both flows go through the same backend.
 #[test]
-fn remove_once_job_when_atd_unavailable() {
+fn remove_once_job_tears_down_systemd_timer() {
     let sb = Sandbox::new();
 
     sb.cmd()
@@ -526,23 +588,26 @@ fn remove_once_job_when_atd_unavailable() {
 
     let id = first_job_id_with_prefix(&sb, "ghost-");
 
-    // Make atrm reproduce the at(1) error you see on NixOS without
-    // services.atd: getpwnam("atd") returns NULL → libc calls
-    // strerror(0) which is "Success".
-    sb.override_stub(
-        "atrm",
-        "printf 'Cannot get uid for atd: Success\\n' 1>&2\nexit 1\n",
-    );
-
     sb.cmd()
         .args(["remove", &id])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Removed"))
-        .stderr(predicate::str::contains("warning"))
-        .stderr(predicate::str::contains("atd"));
+        .stdout(predicate::str::contains("Removed systemd timer"))
+        .stdout(predicate::str::contains("Removed job"));
 
-    // Job is gone from usched's metadata — the source of truth.
+    // Unit files cleaned up.
+    let unit_dir = sb.systemd_user_dir();
+    let remaining: Vec<_> = std::fs::read_dir(&unit_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        !remaining.iter().any(|n| n.contains("ghost-")),
+        "unit files not cleaned: {:?}",
+        remaining
+    );
+
+    // Job gone from jobs.json.
     let listing = String::from_utf8(
         sb.cmd()
             .args(["list"])
@@ -559,20 +624,101 @@ fn remove_once_job_when_atd_unavailable() {
         id,
         listing
     );
+
+    // No at-suite invocations on the remove path either.
+    assert!(
+        sb.invocations_for("atrm").is_empty(),
+        "atrm should not be invoked"
+    );
 }
 
-/// If atrm fails for any other reason, `usched remove` should still
-/// surface that error rather than silently swallow it — we only special-
-/// case the "atd unreachable" signature.
+/// Migration entry point: a jobs.json file authored by an older version of
+/// usched (with `at_job` set on a `once` schedule and no systemd `unit`)
+/// gets re-registered as a systemd timer. The legacy `atrm` is best-effort —
+/// failures are warned about, never propagated.
 #[test]
-fn remove_once_job_propagates_unknown_atrm_error() {
+fn migrate_from_at_re_registers_legacy_once_jobs_on_systemd() {
+    let sb = Sandbox::new();
+
+    // Hand-craft a jobs.json that looks like what the at-backed version
+    // of usched used to write.
+    std::fs::create_dir_all(sb.data_dir()).unwrap();
+    let jobs_json = r#"{
+        "jobs": {
+            "legacy-1": {
+                "id": "legacy-1",
+                "name": "legacy",
+                "schedule": {
+                    "type": "once",
+                    "at": "2099-06-15T09:00:00Z",
+                    "at_job": "42"
+                },
+                "command": ["echo", "hi"],
+                "constraints": {},
+                "enabled": true,
+                "created_at": "2026-01-01T00:00:00Z",
+                "created_by": "user"
+            }
+        }
+    }"#;
+    std::fs::write(sb.jobs_json_path(), jobs_json).unwrap();
+
+    sb.cmd()
+        .args(["migrate-from-at"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 migrated"));
+
+    // After migration, jobs.json should have `unit` set and `at_job` cleared.
+    let after = std::fs::read_to_string(sb.jobs_json_path()).unwrap();
+    assert!(
+        after.contains("\"unit\""),
+        "expected unit handle on once entry: {}",
+        after
+    );
+    assert!(
+        !after.contains("\"at_job\""),
+        "at_job should be cleared after migration: {}",
+        after
+    );
+
+    // .timer + .service files were written.
+    let unit_dir = sb.systemd_user_dir();
+    let entries: Vec<_> = std::fs::read_dir(&unit_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        entries.iter().any(|n| n == "usched-legacy-1.timer"),
+        "expected timer file, got {:?}",
+        entries
+    );
+    assert!(
+        entries.iter().any(|n| n == "usched-legacy-1.service"),
+        "expected service file, got {:?}",
+        entries
+    );
+
+    // Best-effort atrm was attempted on the legacy at-queue handle.
+    let atrm_calls = sb.invocations_for("atrm");
+    assert!(
+        atrm_calls.iter().any(|c| c.contains(" 42")),
+        "expected atrm to be called with legacy job number, got {:?}",
+        atrm_calls
+    );
+}
+
+/// Migration is idempotent: a second run leaves an already-migrated job
+/// alone.
+#[test]
+fn migrate_from_at_is_idempotent() {
     let sb = Sandbox::new();
 
     sb.cmd()
         .args([
             "add",
             "--name",
-            "kept",
+            "fresh",
             "--once",
             "2099-06-15 09:00",
             "--",
@@ -582,16 +728,52 @@ fn remove_once_job_propagates_unknown_atrm_error() {
         .assert()
         .success();
 
-    let id = first_job_id_with_prefix(&sb, "kept-");
+    sb.cmd()
+        .args(["migrate-from-at"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("0 migrated"))
+        .stdout(predicate::str::contains("1 unchanged"));
+}
 
-    sb.override_stub(
-        "atrm",
-        "printf 'atrm: catastrophic failure\\n' 1>&2\nexit 1\n",
-    );
+/// Migration drops one-shots whose absolute fire time is already in the
+/// past — they cannot be meaningfully re-scheduled.
+#[test]
+fn migrate_from_at_drops_past_due_jobs() {
+    let sb = Sandbox::new();
+
+    std::fs::create_dir_all(sb.data_dir()).unwrap();
+    let jobs_json = r#"{
+        "jobs": {
+            "stale-1": {
+                "id": "stale-1",
+                "name": "stale",
+                "schedule": {
+                    "type": "once",
+                    "at": "2000-01-01T00:00:00Z",
+                    "at_job": "13"
+                },
+                "command": ["echo", "hi"],
+                "constraints": {},
+                "enabled": true,
+                "created_at": "2000-01-01T00:00:00Z",
+                "created_by": "user"
+            }
+        }
+    }"#;
+    std::fs::write(sb.jobs_json_path(), jobs_json).unwrap();
 
     sb.cmd()
-        .args(["remove", &id])
+        .args(["migrate-from-at"])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("atrm failed"));
+        .success()
+        .stdout(predicate::str::contains("1 dropped"));
+
+    // Job is gone from jobs.json.
+    let after = std::fs::read_to_string(sb.jobs_json_path()).unwrap();
+    assert!(
+        !after.contains("stale-1"),
+        "stale job should be dropped: {}",
+        after
+    );
 }

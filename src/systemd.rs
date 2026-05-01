@@ -1,10 +1,11 @@
 use anyhow::{Context, Result};
+use chrono::{DateTime, Local, Utc};
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
 use crate::cron_convert::cron_to_oncalendar;
-use crate::job::Job;
+use crate::job::{Job, Schedule};
 
 /// Get the systemd user unit directory.
 fn get_systemd_user_dir() -> PathBuf {
@@ -230,11 +231,100 @@ pub fn find_orphaned_timers(known_units: &std::collections::HashSet<String>) -> 
 
 /// Recreate a timer from job metadata.
 pub fn recreate_timer(job: &Job) -> Result<String> {
-    if let crate::job::Schedule::Cron { expr, .. } = &job.schedule {
-        create_timer(&job.id, expr, &job.command)
-    } else {
-        anyhow::bail!("Cannot recreate timer for non-cron job")
+    match &job.schedule {
+        Schedule::Cron { expr, .. } => create_timer(&job.id, expr, &job.command),
+        Schedule::Once { at, .. } => create_oneshot_timer(&job.id, *at, &job.command),
     }
+}
+
+/// Create a persistent systemd user timer for a one-shot job.
+///
+/// Writes .timer and .service unit files to ~/.config/systemd/user/, with
+/// `OnCalendar=<absolute timestamp>` and `Persistent=true`. Persistent
+/// matters: if the host is suspended past the fire time, systemd fires on
+/// resume rather than skipping. The timer is "one-shot" by virtue of the
+/// `OnCalendar` being a single absolute moment — once it has elapsed, the
+/// timer goes inactive and won't re-fire.
+pub fn create_oneshot_timer(
+    job_id: &str,
+    at: DateTime<Utc>,
+    _command: &[String],
+) -> Result<String> {
+    let local_at: DateTime<Local> = at.into();
+    let oncalendar = local_at.format("%Y-%m-%d %H:%M:%S").to_string();
+
+    let unit_name = format!("usched-{}", job_id);
+    let systemd_dir = get_systemd_user_dir();
+    fs::create_dir_all(&systemd_dir)?;
+
+    let usched_path = get_usched_path();
+    let exec_start = format!(
+        "{} __run-job {}",
+        systemd_quote(&usched_path),
+        systemd_quote(job_id),
+    );
+
+    // Capture current PATH for the service environment
+    let path_env = std::env::var("PATH").unwrap_or_default();
+
+    // One-shot timers don't need OnBootSec/RandomizedDelaySec — those are
+    // for recurring jobs that should spread load on boot. A one-shot job
+    // just wants to fire at its absolute time (or on the next boot if it
+    // was missed, courtesy of Persistent=true).
+    let timer_content = format!(
+        r#"[Unit]
+Description=usched one-shot job: {job_id}
+
+[Timer]
+OnCalendar={oncalendar}
+Persistent=true
+Unit={unit_name}.service
+
+[Install]
+WantedBy=timers.target
+"#
+    );
+    fs::write(
+        systemd_dir.join(format!("{}.timer", unit_name)),
+        timer_content,
+    )?;
+
+    let service_content = format!(
+        r#"[Unit]
+Description=usched one-shot job: {job_id}
+
+[Service]
+Type=oneshot
+Environment="PATH={path_env}"
+ExecStart={exec_start}
+"#
+    );
+    fs::write(
+        systemd_dir.join(format!("{}.service", unit_name)),
+        service_content,
+    )?;
+
+    let output = Command::new("systemctl")
+        .args(["--user", "daemon-reload"])
+        .output()
+        .context("Failed to daemon-reload")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("daemon-reload failed: {}", stderr);
+    }
+
+    let output = Command::new("systemctl")
+        .args(["--user", "enable", "--now", &format!("{}.timer", unit_name)])
+        .output()
+        .context("Failed to enable timer")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to enable timer: {}", stderr);
+    }
+
+    Ok(unit_name)
 }
 
 /// Resolve an absolute path to the `usched` binary for use in systemd
